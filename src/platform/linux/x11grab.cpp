@@ -154,10 +154,14 @@ namespace platf {
     }  // namespace fix
 
     namespace composite {
+      using query_extension_fn = Bool (*)(Display *, int *, int *);
+      using query_version_fn = Status (*)(Display *, int *, int *);
       using name_window_pixmap_fn = Pixmap (*)(Display *, Window);
       using redirect_subwindows_fn = void (*)(Display *, Window, int);
       using unredirect_subwindows_fn = void (*)(Display *, Window, int);
 
+      static query_extension_fn QueryExtension {nullptr};
+      static query_version_fn QueryVersion {nullptr};
       static name_window_pixmap_fn NameWindowPixmap {nullptr};
       static redirect_subwindows_fn RedirectSubwindows {nullptr};
       static unredirect_subwindows_fn UnredirectSubwindows {nullptr};
@@ -180,6 +184,8 @@ namespace platf {
           }
         }
         std::vector<std::tuple<dyn::apiproc *, const char *>> funcs {
+          {(dyn::apiproc *) &QueryExtension, "XCompositeQueryExtension"},
+          {(dyn::apiproc *) &QueryVersion, "XCompositeQueryVersion"},
           {(dyn::apiproc *) &NameWindowPixmap, "XCompositeNameWindowPixmap"},
           {(dyn::apiproc *) &RedirectSubwindows, "XCompositeRedirectSubwindows"},
           {(dyn::apiproc *) &UnredirectSubwindows, "XCompositeUnredirectSubwindows"},
@@ -798,11 +804,13 @@ namespace platf {
   struct x11_gpu_attr_t: public x11_attr_t {
     egl::display_t egl_display;  ///< EGL display connected to the X11 server.
     std::optional<egl::ctx_t> egl_context;  ///< Current OpenGL context.
-    gl::program_t cursor_program;  ///< Shader used to alpha-composite the XFixes cursor.
+    gl::program_t compositor_program;  ///< Shader used to sample imported X11 pixmaps.
     gl::tex_t cursor_texture;  ///< Cursor image texture.
-    GLuint cursor_vao {0};  ///< Empty vertex array used by the cursor triangle.
+    GLuint compositor_vao {0};  ///< Empty vertex array used by the compositor triangle.
+    GLint uv_rect_location {-1};  ///< Shader location for normalized source crop coordinates.
     int cursor_width {0};  ///< Width of the uploaded cursor texture.
     int cursor_height {0};  ///< Height of the uploaded cursor texture.
+    bool subwindows_redirected {false};  ///< Whether this client redirected root child windows.
 
     /**
      * @brief Construct a GPU X11 display.
@@ -812,11 +820,16 @@ namespace platf {
     }
 
     /**
-     * @brief Release the OpenGL vertex array used for cursor compositing.
+     * @brief Release XComposite redirection and OpenGL compositor resources.
      */
     ~x11_gpu_attr_t() override {
-      if (cursor_vao != 0 && egl_context) {
-        gl::ctx.DeleteVertexArrays(1, &cursor_vao);
+      if (subwindows_redirected && xdisplay) {
+        // CompositeRedirectAutomatic is defined as 0 by the XComposite protocol.
+        x11::composite::UnredirectSubwindows(xdisplay.get(), xwindow, 0);
+        XSync(xdisplay.get(), False);
+      }
+      if (compositor_vao != 0 && egl_context) {
+        gl::ctx.DeleteVertexArrays(1, &compositor_vao);
       }
     }
 
@@ -853,43 +866,37 @@ namespace platf {
       img->height = height;
       img->pixel_pitch = 4;
       img->row_pitch = img->surface->surfaceList[0].pitch;
+      img->y_invert = true;
       std::fill_n(img->sd.fds, 4, -1);
       img->sd.width = width;
       img->sd.height = height;
       img->sd.fourcc = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
       img->sd.modifier = 0;
-      NvBufSurfaceMapParams map_params {};
-      if (NvBufSurfaceGetMapParams(img->surface, 0, &map_params) != 0) {
-        BOOST_LOG(error) << "Could not export X11 GPU compositor surface"sv;
-        NvBufSurfaceDestroy(img->surface);
-        img->surface = nullptr;
-        return nullptr;
-      }
-      img->sd.fds[0] = dup(static_cast<int>(map_params.fd));
-      img->sd.pitches[0] = map_params.planes[0].pitch;
-      img->sd.offsets[0] = map_params.planes[0].offset;
-      if (img->sd.fds[0] < 0) {
-        BOOST_LOG(error) << "Could not duplicate X11 GPU compositor DMA-BUF"sv;
-        NvBufSurfaceDestroy(img->surface);
-        img->surface = nullptr;
-        return nullptr;
-      }
+      // The DMA-BUF is exported only after rendering. Exporting it here and
+      // replacing the descriptor on the first snapshot leaks the initial fd.
+      img->sd.pitches[0] = img->surface->surfaceList[0].pitch;
+      img->sd.offsets[0] = 0;
       return img;
     }
 
     /**
-     * @brief Build a GL texture from an X11 native pixmap.
+     * @brief Build a sampleable GL texture from an X11 native pixmap.
+     *
+     * NVIDIA's EGL native-pixmap import is reliably sampleable as a texture,
+     * but it is not guaranteed to be framebuffer-renderable. Keep the imported
+     * pixmap on the texture path and render it with the compositor shader.
      *
      * @param pixmap X11 pixmap identifier.
      * @param texture Output texture bound to the EGL image.
      * @param image Output EGL image handle.
-     * @param framebuffer Output framebuffer attached to the texture.
-     * @param width Pixmap width.
-     * @param height Pixmap height.
      * @return True when the pixmap was imported successfully.
      */
-    bool import_pixmap(Pixmap pixmap, gl::tex_t &texture, EGLImage &image, gl::frame_buf_t &framebuffer, int width, int height) {
+    bool import_pixmap(Pixmap pixmap, gl::tex_t &texture, EGLImage &image) {
       const EGLAttrib image_attributes[] {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+      while (gl::ctx.GetError() != GL_NO_ERROR) {
+      }
+      while (eglGetError() != EGL_SUCCESS) {
+      }
       image = eglCreateImage(
         egl_display.get(),
         EGL_NO_CONTEXT,
@@ -908,17 +915,20 @@ namespace platf {
         return false;
       }
       gl::ctx.BindTexture(GL_TEXTURE_2D, texture[0]);
+      gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
       gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
       gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
       gl::egl_image_target_texture_2d()(GL_TEXTURE_2D, image);
+      const auto gl_error = gl::ctx.GetError();
+      const auto egl_error = eglGetError();
       gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-
-      framebuffer = gl::frame_buf_t::make(1);
-      gl::ctx.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer[0]);
-      gl::ctx.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture[0], 0);
-      const auto status = gl::ctx.CheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-      gl::ctx.BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-      return status == GL_FRAMEBUFFER_COMPLETE && width > 0 && height > 0;
+      if (gl_error != GL_NO_ERROR || egl_error != EGL_SUCCESS) {
+        eglDestroyImage(egl_display.get(), image);
+        image = EGL_NO_IMAGE;
+        return false;
+      }
+      return true;
     }
 
     /**
@@ -955,7 +965,7 @@ namespace platf {
      * @param cursor Whether the client requested cursor compositing.
      * @return Capture status.
      */
-    capture_e snapshot(x11_gpu_img_t &img, bool /*cursor*/) {
+    capture_e snapshot(x11_gpu_img_t &img, bool cursor_enabled) {
       if (!egl_context || eglMakeCurrent(egl_display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(*egl_context->operator->())) == EGL_FALSE) {
         return capture_e::error;
       }
@@ -966,41 +976,98 @@ namespace platf {
         img.egl_mapped = true;
         img.target_image = static_cast<EGLImage>(img.surface->surfaceList[0].mappedAddr.eglImage);
         img.target_texture = gl::tex_t::make(1);
+        if (img.target_texture.size() != 1) {
+          return capture_e::error;
+        }
+        while (gl::ctx.GetError() != GL_NO_ERROR) {
+        }
+        while (eglGetError() != EGL_SUCCESS) {
+        }
         gl::ctx.BindTexture(GL_TEXTURE_2D, img.target_texture[0]);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         gl::egl_image_target_texture_2d()(GL_TEXTURE_2D, img.target_image);
+        const auto target_gl_error = gl::ctx.GetError();
+        const auto target_egl_error = eglGetError();
         gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+        if (target_gl_error != GL_NO_ERROR || target_egl_error != EGL_SUCCESS) {
+          BOOST_LOG(error) << "Could not bind X11 GPU compositor output EGL image; GL="sv << target_gl_error << ", EGL="sv << target_egl_error;
+          return capture_e::error;
+        }
         img.target_framebuffer = gl::frame_buf_t::make(1);
         gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, img.target_framebuffer[0]);
         gl::ctx.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, img.target_texture[0], 0);
+        const auto target_status = gl::ctx.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
         gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        if (target_status != GL_FRAMEBUFFER_COMPLETE) {
+          BOOST_LOG(error) << "X11 GPU compositor target framebuffer is incomplete: "sv << target_status;
+          return capture_e::error;
+        }
       }
 
       gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, img.target_framebuffer[0]);
       gl::ctx.Viewport(0, 0, width, height);
       gl::ctx.Disable(GL_SCISSOR_TEST);
+      gl::ctx.Disable(GL_BLEND);
       gl::ctx.ClearColor(0.0f, 0.0f, 0.0f, 1.0f);
       gl::ctx.Clear(GL_COLOR_BUFFER_BIT);
+      gl::ctx.UseProgram(compositor_program.handle());
+      gl::ctx.BindVertexArray(compositor_vao);
+      gl::ctx.ActiveTexture(GL_TEXTURE0);
 
-      auto blit_pixmap = [&](Pixmap pixmap, int source_width, int source_height, int dst_x, int dst_y, int source_x, int source_y, int copy_width, int copy_height) {
+      auto draw_texture = [&](GLuint texture, int source_width, int source_height, int dst_left, int dst_top, int source_left, int source_top, int copy_width, int copy_height, bool alpha_blend) {
+        if (texture == 0 || source_width <= 0 || source_height <= 0 || copy_width <= 0 || copy_height <= 0) {
+          return false;
+        }
+        const auto dst_bottom = height - dst_top - copy_height;
+        const auto source_bottom = source_height - source_top - copy_height;
+        if (dst_left < 0 || dst_bottom < 0 || source_left < 0 || source_bottom < 0) {
+          return false;
+        }
+        gl::ctx.Viewport(dst_left, dst_bottom, copy_width, copy_height);
+        gl::ctx.Uniform4f(
+          uv_rect_location,
+          static_cast<float>(source_left) / static_cast<float>(source_width),
+          static_cast<float>(source_bottom) / static_cast<float>(source_height),
+          static_cast<float>(copy_width) / static_cast<float>(source_width),
+          static_cast<float>(copy_height) / static_cast<float>(source_height)
+        );
+        gl::ctx.BindTexture(GL_TEXTURE_2D, texture);
+        if (alpha_blend) {
+          gl::ctx.Enable(GL_BLEND);
+          gl::ctx.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        } else {
+          gl::ctx.Disable(GL_BLEND);
+        }
+        gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
+        const auto draw_error = gl::ctx.GetError();
+        if (draw_error != GL_NO_ERROR) {
+          BOOST_LOG(error) << "X11 GPU compositor draw failed with GL error "sv << draw_error;
+          return false;
+        }
+        return true;
+      };
+
+      auto draw_pixmap = [&](Pixmap pixmap, int source_width, int source_height, int dst_left, int dst_top, int source_left, int source_top, int copy_width, int copy_height, bool alpha_blend) {
         if (pixmap == None || copy_width <= 0 || copy_height <= 0) {
-          return;
+          return false;
         }
         gl::tex_t source_texture;
         EGLImage source_image = EGL_NO_IMAGE;
-        gl::frame_buf_t source_fb;
-        if (!import_pixmap(pixmap, source_texture, source_image, source_fb, source_width, source_height)) {
-          return;
+        if (!import_pixmap(pixmap, source_texture, source_image)) {
+          return false;
         }
-        gl::ctx.BindFramebuffer(GL_READ_FRAMEBUFFER, source_fb[0]);
-        gl::ctx.BlitFramebuffer(source_x, source_y, source_x + copy_width, source_y + copy_height,
-                                dst_x, dst_y, dst_x + copy_width, dst_y + copy_height,
-                                GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        gl::ctx.BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        const auto rendered = draw_texture(source_texture[0], source_width, source_height, dst_left, dst_top, source_left, source_top, copy_width, copy_height, alpha_blend);
+        gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
         eglDestroyImage(egl_display.get(), source_image);
+        return rendered;
       };
 
+      bool rendered_any_pixmap = false;
       const auto background = root_pixmap();
-      blit_pixmap(background, env_width, env_height, 0, 0, offset_x, offset_y, width, height);
+      rendered_any_pixmap |= draw_pixmap(background, env_width, env_height, 0, 0, offset_x, offset_y, width, height, false);
 
       Window root_return = None;
       Window parent_return = None;
@@ -1012,14 +1079,28 @@ namespace platf {
           if (!XGetWindowAttributes(xdisplay.get(), children[index], &attributes) || attributes.map_state != IsViewable || attributes.width <= 0 || attributes.height <= 0) {
             continue;
           }
-          const auto pixmap = x11::composite::NameWindowPixmap(xdisplay.get(), children[index]);
           const auto left = std::max(attributes.x - offset_x, 0);
           const auto top = std::max(attributes.y - offset_y, 0);
           const auto source_left = std::max(offset_x - attributes.x, 0);
           const auto source_top = std::max(offset_y - attributes.y, 0);
           const auto copy_width = std::min(attributes.width - source_left, width - left);
           const auto copy_height = std::min(attributes.height - source_top, height - top);
-          blit_pixmap(pixmap, attributes.width, attributes.height, left, height - top - copy_height, source_left, attributes.height - source_top - copy_height, copy_width, copy_height);
+          if (copy_width <= 0 || copy_height <= 0) {
+            continue;
+          }
+          const auto pixmap = x11::composite::NameWindowPixmap(xdisplay.get(), children[index]);
+          rendered_any_pixmap |= draw_pixmap(
+            pixmap,
+            attributes.width,
+            attributes.height,
+            left,
+            top,
+            source_left,
+            source_top,
+            copy_width,
+            copy_height,
+            attributes.depth == 32
+          );
           if (pixmap != None) {
             XFreePixmap(xdisplay.get(), pixmap);
           }
@@ -1029,52 +1110,60 @@ namespace platf {
         }
       }
 
-      auto *cursor = x11::fix::GetCursorImage(xdisplay.get());
-      if (cursor && cursor_program.handle() != std::numeric_limits<GLuint>::max()) {
-        const auto cursor_x = static_cast<int>(cursor->x) - static_cast<int>(cursor->xhot) - offset_x;
-        const auto cursor_y = static_cast<int>(cursor->y) - static_cast<int>(cursor->yhot) - offset_y;
-        if (cursor_x < width && cursor_y < height && cursor_x + cursor->width > 0 && cursor_y + cursor->height > 0) {
-          if (cursor_width != cursor->width || cursor_height != cursor->height) {
-            cursor_width = cursor->width;
-            cursor_height = cursor->height;
-            cursor_texture = gl::tex_t::make(1);
-            gl::ctx.BindTexture(GL_TEXTURE_2D, cursor_texture[0]);
-            gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cursor_width, cursor_height, 0, GL_BGRA, GL_UNSIGNED_BYTE, cursor->pixels);
-            gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-          } else {
-            gl::ctx.BindTexture(GL_TEXTURE_2D, cursor_texture[0]);
-            gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cursor_width, cursor_height, GL_BGRA, GL_UNSIGNED_BYTE, cursor->pixels);
-            gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-          }
-          const auto left = std::max(cursor_x, 0);
-          const auto top = std::max(cursor_y, 0);
-          const auto right = std::min(cursor_x + cursor->width, width);
-          const auto bottom = std::min(cursor_y + cursor->height, height);
-          gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, img.target_framebuffer[0]);
-          gl::ctx.Viewport(left, height - bottom, right - left, bottom - top);
-          gl::ctx.UseProgram(cursor_program.handle());
-          gl::ctx.ActiveTexture(GL_TEXTURE0);
-          gl::ctx.BindTexture(GL_TEXTURE_2D, cursor_texture[0]);
-          gl::ctx.Enable(GL_BLEND);
-          gl::ctx.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-          gl::ctx.BindVertexArray(cursor_vao);
-          gl::ctx.DrawArrays(GL_TRIANGLES, 0, 3);
-          gl::ctx.BindVertexArray(0);
-          gl::ctx.Disable(GL_BLEND);
-          gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-        }
-        x11::Free(cursor);
+      if (!rendered_any_pixmap) {
+        gl::ctx.BindVertexArray(0);
+        gl::ctx.UseProgram(0);
+        gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        BOOST_LOG(error) << "X11 GPU compositor could not import any desktop pixmaps"sv;
+        return capture_e::error;
       }
 
+      if (cursor_enabled) {
+        auto *cursor = x11::fix::GetCursorImage(xdisplay.get());
+        if (cursor) {
+          const auto cursor_x = static_cast<int>(cursor->x) - static_cast<int>(cursor->xhot) - offset_x;
+          const auto cursor_y = static_cast<int>(cursor->y) - static_cast<int>(cursor->yhot) - offset_y;
+          if (cursor_x < width && cursor_y < height && cursor_x + cursor->width > 0 && cursor_y + cursor->height > 0) {
+            if (cursor_width != cursor->width || cursor_height != cursor->height) {
+              cursor_width = cursor->width;
+              cursor_height = cursor->height;
+              cursor_texture = gl::tex_t::make(1);
+              gl::ctx.BindTexture(GL_TEXTURE_2D, cursor_texture[0]);
+              gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+              gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+              gl::ctx.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cursor_width, cursor_height, 0, GL_BGRA, GL_UNSIGNED_BYTE, cursor->pixels);
+            } else {
+              gl::ctx.BindTexture(GL_TEXTURE_2D, cursor_texture[0]);
+              gl::ctx.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cursor_width, cursor_height, GL_BGRA, GL_UNSIGNED_BYTE, cursor->pixels);
+            }
+            gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+            const auto left = std::max(cursor_x, 0);
+            const auto top = std::max(cursor_y, 0);
+            const auto source_left = std::max(-cursor_x, 0);
+            const auto source_top = std::max(-cursor_y, 0);
+            const auto copy_width = std::min(static_cast<int>(cursor->width) - source_left, width - left);
+            const auto copy_height = std::min(static_cast<int>(cursor->height) - source_top, height - top);
+            draw_texture(cursor_texture[0], cursor_width, cursor_height, left, top, source_left, source_top, copy_width, copy_height, true);
+          }
+          x11::Free(cursor);
+        }
+      }
+
+      gl::ctx.Disable(GL_BLEND);
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+      gl::ctx.BindVertexArray(0);
+      gl::ctx.UseProgram(0);
       gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-      // The VIC consumer runs in a separate driver queue.  A flush alone can
-      // leave the exported DMA-BUF backed by an unfinished GL render, which
-      // appears as an all-black frame to the encoder.
+      // The VIC consumer runs in a separate driver queue. Ensure rendering is
+      // complete before exporting the DMA-BUF to the encoder conversion path.
       gl::ctx.Finish();
       img.frame_timestamp = std::chrono::steady_clock::now();
-      img.sd.fds[0] = -1;
+      if (img.sd.fds[0] >= 0) {
+        close(img.sd.fds[0]);
+        img.sd.fds[0] = -1;
+      }
       NvBufSurfaceMapParams map_params {};
       if (NvBufSurfaceGetMapParams(img.surface, 0, &map_params) != 0) {
         return capture_e::error;
@@ -1118,6 +1207,26 @@ namespace platf {
       if (x11_attr_t::init(display_name, config) || x11::composite::init()) {
         return -1;
       }
+
+      int composite_event = 0;
+      int composite_error = 0;
+      int composite_major = 0;
+      int composite_minor = 0;
+      if (!x11::composite::QueryExtension(xdisplay.get(), &composite_event, &composite_error) ||
+          !x11::composite::QueryVersion(xdisplay.get(), &composite_major, &composite_minor) ||
+          composite_major < 0 || (composite_major == 0 && composite_minor < 2)) {
+        BOOST_LOG(error) << "XComposite 0.2 or newer is required for GPU X11 capture"sv;
+        return -1;
+      }
+
+      // XCompositeNameWindowPixmap only has defined contents for redirected
+      // windows. Redirect the root children once for the lifetime of this GPU
+      // capture client. CompositeRedirectAutomatic is 0 in the protocol and
+      // may be requested by multiple clients.
+      x11::composite::RedirectSubwindows(xdisplay.get(), xwindow, 0);
+      XSync(xdisplay.get(), False);
+      subwindows_redirected = true;
+
       egl_display = egl::make_display(xdisplay.get());
       if (!egl_display) {
         return -1;
@@ -1132,9 +1241,11 @@ namespace platf {
       const auto vertex = gl::shader_t::compile(
         "#version 330\n"
         "out vec2 texcoord;\n"
+        "uniform vec4 uv_rect;\n"
         "void main() {\n"
         "  const vec2 positions[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));\n"
-        "  texcoord = (positions[gl_VertexID] + 1.0) * 0.5;\n"
+        "  const vec2 uv = (positions[gl_VertexID] + 1.0) * 0.5;\n"
+        "  texcoord = uv_rect.xy + uv * uv_rect.zw;\n"
         "  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);\n"
         "}\n",
         GL_VERTEX_SHADER
@@ -1143,8 +1254,8 @@ namespace platf {
         "#version 330\n"
         "in vec2 texcoord;\n"
         "out vec4 color;\n"
-        "uniform sampler2D cursor_texture;\n"
-        "void main() { color = texture(cursor_texture, texcoord); }\n",
+        "uniform sampler2D source_texture;\n"
+        "void main() { color = texture(source_texture, texcoord); }\n",
         GL_FRAGMENT_SHADER
       );
       if (vertex.has_right() || fragment.has_right()) {
@@ -1154,9 +1265,21 @@ namespace platf {
       if (program.has_right()) {
         return -1;
       }
-      cursor_program = std::move(program.left());
-      gl::ctx.GenVertexArrays(1, &cursor_vao);
-      BOOST_LOG(info) << "X11 GPU compositor enabled through EGL native pixmaps"sv;
+      compositor_program = std::move(program.left());
+      uv_rect_location = gl::ctx.GetUniformLocation(compositor_program.handle(), "uv_rect");
+      const auto source_texture_location = gl::ctx.GetUniformLocation(compositor_program.handle(), "source_texture");
+      if (uv_rect_location < 0 || source_texture_location < 0) {
+        BOOST_LOG(error) << "Could not locate X11 GPU compositor shader uniforms"sv;
+        return -1;
+      }
+      gl::ctx.UseProgram(compositor_program.handle());
+      gl::ctx.Uniform1i(source_texture_location, 0);
+      gl::ctx.UseProgram(0);
+      gl::ctx.GenVertexArrays(1, &compositor_vao);
+      if (compositor_vao == 0) {
+        return -1;
+      }
+      BOOST_LOG(info) << "X11 GPU compositor enabled through sampled EGL native pixmaps"sv;
       return 0;
     }
 
