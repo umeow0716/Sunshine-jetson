@@ -110,6 +110,15 @@ endif()
 include(dependencies/libevdev_Sunshine)
 
 # vaapi
+if(LINUX)
+    include(CheckLibraryExists)
+    check_library_exists(va vaMapBuffer2 "" LIBVA_HAS_VA_MAP_BUFFER2)
+    if(NOT LIBVA_HAS_VA_MAP_BUFFER2)
+        list(APPEND PLATFORM_TARGET_FILES
+                "${CMAKE_SOURCE_DIR}/src/platform/linux/vaapi_compat.cpp")
+    endif()
+endif()
+
 if(${SUNSHINE_ENABLE_VAAPI})
     find_package(Libva REQUIRED)
 else()
@@ -141,6 +150,35 @@ if(JETSON_GSTREAMER_FOUND)
             "${CMAKE_SOURCE_DIR}/src/jetson/jetson_encoder.h"
             "${CMAKE_SOURCE_DIR}/src/jetson/jetson_encoder.cpp")
     message(STATUS "NVIDIA Jetson GStreamer encoder enabled")
+
+    if(${SUNSHINE_ENABLE_JETSON_NVMM})
+        find_path(JETSON_NVBUF_INCLUDE_DIR
+                NAMES nvbufsurface.h
+                HINTS /usr/src/jetson_multimedia_api/include)
+        find_library(JETSON_NVBUF_LIBRARY
+                NAMES nvbufsurface
+                HINTS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/nvidia)
+        find_library(JETSON_NVBUF_TRANSFORM_LIBRARY
+                NAMES nvbufsurftransform
+                HINTS /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/nvidia)
+
+        if(JETSON_NVBUF_INCLUDE_DIR AND JETSON_NVBUF_LIBRARY)
+            include_directories(SYSTEM ${JETSON_NVBUF_INCLUDE_DIR})
+            list(APPEND PLATFORM_LIBRARIES ${JETSON_NVBUF_LIBRARY})
+            list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_BUILD_JETSON_NVMM=1)
+            message(STATUS "NVIDIA Jetson direct NVMM input enabled")
+
+            if(JETSON_NVBUF_TRANSFORM_LIBRARY AND EXISTS "${JETSON_NVBUF_INCLUDE_DIR}/nvbufsurftransform.h")
+                list(APPEND PLATFORM_LIBRARIES ${JETSON_NVBUF_TRANSFORM_LIBRARY})
+                list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_BUILD_JETSON_VIC=1)
+                message(STATUS "NVIDIA Jetson VIC color conversion enabled")
+            else()
+                message(STATUS "NVIDIA Jetson VIC color conversion disabled: NvBufSurfTransform development files not found")
+            endif()
+        else()
+            message(STATUS "NVIDIA Jetson direct NVMM input disabled: NvBufSurface development files not found")
+        endif()
+    endif()
 elseif(${SUNSHINE_ENABLE_JETSON} AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     message(STATUS "NVIDIA Jetson GStreamer encoder disabled: development packages not found")
 endif()

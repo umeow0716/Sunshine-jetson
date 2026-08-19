@@ -440,6 +440,24 @@ After adding yourself to the group, log out and log back in for the changes to t
 
 ### Linux
 
+#### NVIDIA Jetson hardware encoding
+
+ARM64 builds enable the Jetson GStreamer encoder when the GStreamer application and video development
+packages are available. If `nvbufsurface.h` and `libnvbufsurface` from Jetson Linux are also installed,
+`SUNSHINE_ENABLE_JETSON_NVMM=ON` enables a reusable block-linear `NvBufSurface` pool. Sunshine then sends
+NV12 or P010 surfaces directly to `nvv4l2h264enc` or `nvv4l2h265enc`, bypassing `nvvidconv`.
+
+When `libnvbufsurftransform` is available, packed BGRx captures use VIC for scaling and color conversion into
+the encoder surface. Sunshine retains the last packed source in NVMM so minimum-FPS repeats do not perform
+another CPU copy. Already-converted NV12 or P010 frames can also be copied directly into the encoder surface.
+Capture backends that provide a supported NVIDIA RGB DMA-BUF can import it through the public
+`NvBufSurfaceImport` API, allowing DMA-BUF to VIC to NVMM to encoder processing without a full-frame CPU
+copy. On GNOME X11, select `portal` as the capture method to request this path through PipeWire; the ordinary
+`x11` capture method continues to use its existing CPU-backed frame and VIC upload. The default capture
+selection is unchanged. If the compositor does not negotiate DMA-BUF, or if NVMM allocation or direct-pipeline
+initialization fails, Sunshine retains its existing system-memory fallbacks. The startup log reports the active
+input and conversion paths.
+
 #### NVIDIA Jetson Linux 39.2 virtual input
 
 NVIDIA Jetson Linux 39.2 kernels may ship with `CONFIG_INPUT_UINPUT` disabled. On an AArch64

@@ -66,6 +66,40 @@ namespace jetson {
   };
 
   /**
+   * @brief Packed BGRx frame accepted by the Jetson VIC conversion path.
+   */
+  struct bgrx_frame_view_t {
+    const std::uint8_t *data;  ///< First byte of the packed BGRx image.
+    int width;  ///< Source image width in pixels.
+    int height;  ///< Source image height in pixels.
+    int row_stride;  ///< Bytes between adjacent packed image rows.
+  };
+
+  /**
+   * @brief Packed RGB pixel formats accepted from a DMA-BUF capture source.
+   */
+  enum class dmabuf_pixel_format_e {
+    bgrx,  ///< BGR with an unused fourth byte.
+    bgra,  ///< BGR with alpha in the fourth byte.
+    rgbx,  ///< RGB with an unused fourth byte.
+    rgba,  ///< RGB with alpha in the fourth byte.
+  };
+
+  /**
+   * @brief Single-plane packed RGB DMA-BUF imported by the Jetson VIC path.
+   */
+  struct dmabuf_frame_view_t {
+    int fd;  ///< DMA-BUF file descriptor retained by the capture frame.
+    int width;  ///< Source image width in pixels.
+    int height;  ///< Source image height in pixels.
+    std::uint32_t pitch;  ///< Bytes between adjacent packed image rows.
+    std::uint32_t offset;  ///< Byte offset of the image within the DMA-BUF.
+    std::uint64_t modifier;  ///< DRM layout modifier reported by the producer.
+    dmabuf_pixel_format_e pixel_format;  ///< Packed RGB component order.
+    bool y_invert;  ///< Whether VIC must vertically invert the imported frame.
+  };
+
+  /**
    * @brief Encoded access unit returned by the Jetson pipeline.
    */
   struct encoded_frame_t {
@@ -115,7 +149,7 @@ namespace jetson {
      * @brief Check whether the required Jetson GStreamer factories are installed.
      *
      * @param codec Codec whose factory should be checked.
-     * @return True when appsrc, nvvidconv, the encoder, and appsink are available.
+     * @return True when appsrc, the encoder, appsink, and a usable input path are available.
      */
     static bool is_available(codec_e codec);
 
@@ -136,6 +170,45 @@ namespace jetson {
      * @return Encoded access unit, or no value when the pipeline fails.
      */
     std::optional<encoded_frame_t> encode(const frame_view_t &frame, std::uint64_t frame_index, bool force_idr);
+
+    /**
+     * @brief Convert a packed BGRx frame into a prepared NVMM encoder surface using VIC.
+     *
+     * @param frame Source image and layout.
+     * @return True when a converted frame is ready for `encode_prepared()`.
+     */
+    bool prepare_bgrx(const bgrx_frame_view_t &frame);
+
+    /**
+     * @brief Import a packed RGB DMA-BUF and convert it into encoder NVMM using VIC.
+     *
+     * @param frame DMA-BUF descriptor and packed pixel layout.
+     * @return True when an imported frame is ready for `encode_prepared()`.
+     */
+    bool prepare_dmabuf(const dmabuf_frame_view_t &frame);
+
+    /**
+     * @brief Submit the most recently prepared VIC frame to the hardware encoder.
+     *
+     * @param frame_index Monotonic Sunshine frame index.
+     * @param force_idr Whether the hardware encoder must emit an IDR picture.
+     * @return Encoded access unit, or no value when no frame is prepared or encoding fails.
+     */
+    std::optional<encoded_frame_t> encode_prepared(std::uint64_t frame_index, bool force_idr);
+
+    /**
+     * @brief Report whether VIC conversion can feed the active direct-NVMM pipeline.
+     *
+     * @return True when NvBufSurfTransform support and direct NVMM input are active.
+     */
+    bool supports_vic() const;
+
+    /**
+     * @brief Report whether the active pipeline accepts direct NVMM surfaces.
+     *
+     * @return True when frames bypass `nvvidconv` and enter the encoder as `NvBufSurface` objects.
+     */
+    bool uses_nvmm() const;
 
     /**
      * @brief Return the most recent initialization or encoding error.

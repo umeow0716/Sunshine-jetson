@@ -308,6 +308,7 @@ namespace platf {
     cuda,  ///< CUDA
     videotoolbox,  ///< VideoToolbox
     vulkan,  ///< Vulkan
+    nvmm,  ///< NVIDIA Jetson DMA-BUF/NVMM
     unknown  ///< Unknown
   };
 

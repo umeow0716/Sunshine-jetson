@@ -23,6 +23,9 @@
 #include "vaapi.h"
 #include "vulkan_encode.h"
 #include "wayland.h"
+#ifdef SUNSHINE_BUILD_X11
+  #include "x11grab.h"
+#endif
 
 #if !PW_CHECK_VERSION(1, 6, 0)
 constexpr int SPA_VIDEO_TRANSFER_SMPTE2084 = 14;  ///< Protocol or platform constant for spa video transfer smpte2084.
@@ -313,9 +316,14 @@ namespace pipewire {
         // be imported into CUDA, so we fall back to memory buffers in that case.
         bool use_dmabuf = n_dmabuf_infos > 0 && (mem_type == platf::mem_type_e::vaapi ||
                                                  mem_type == platf::mem_type_e::vulkan ||
-                                                 (mem_type == platf::mem_type_e::cuda && display_is_nvidia));
+                                                 ((mem_type == platf::mem_type_e::cuda || mem_type == platf::mem_type_e::nvmm) && display_is_nvidia));
         if (use_dmabuf) {
           for (int i = 0; i < n_dmabuf_infos; i++) {
+            if (mem_type == platf::mem_type_e::nvmm &&
+                dmabuf_infos[i].format != SPA_VIDEO_FORMAT_BGRx &&
+                dmabuf_infos[i].format != SPA_VIDEO_FORMAT_BGRA) {
+              continue;
+            }
             auto format_param = build_format_parameter(&pod_builder, width, height, refresh_rate, dmabuf_infos[i].format, dmabuf_infos[i].modifiers, dmabuf_infos[i].n_modifiers);
             params[n_params] = format_param;
             n_params++;
@@ -744,6 +752,7 @@ namespace pipewire {
         case vaapi:
         case cuda:
         case vulkan:
+        case nvmm:
           return true;
         default:
           return false;
@@ -1224,11 +1233,26 @@ namespace pipewire {
     }
 
     int get_dmabuf_modifiers() {
-      if (wl_display.init() < 0) {
+      egl::display_t egl_display;
+#ifdef SUNSHINE_BUILD_X11
+      platf::x11::xdisplay_t x11_display;
+#endif
+      if (window_system == window_system_e::WAYLAND) {
+        if (wl_display.init() < 0) {
+          return -1;
+        }
+        egl_display = egl::make_display(wl_display.get());
+#ifdef SUNSHINE_BUILD_X11
+      } else if (window_system == window_system_e::X11) {
+        x11_display = platf::x11::make_display();
+        if (!x11_display) {
+          return -1;
+        }
+        egl_display = egl::make_display(x11_display.get());
+#endif
+      } else {
         return -1;
       }
-
-      auto egl_display = egl::make_display(wl_display.get());
       if (!egl_display) {
         return -1;
       }
@@ -1237,30 +1261,25 @@ namespace pipewire {
       // On hybrid systems, the wayland compositor typically runs on Intel,
       // so DMA-BUFs from portal will come from Intel and cannot be imported into CUDA.
       // Check if Intel GPU exists - if so, assume hybrid system and disable CUDA DMA-BUF.
-      bool has_intel_gpu = std::ifstream("/sys/class/drm/card0/device/vendor").good() ||
-                           std::ifstream("/sys/class/drm/card1/device/vendor").good();
-      if (has_intel_gpu) {
-        // Read vendor IDs to check for Intel (0x8086)
-        auto check_intel = [](const std::string &path) {
-          if (std::ifstream f(path); f.good()) {
-            std::string vendor;
-            f >> vendor;
-            return vendor == "0x8086";
-          }
-          return false;
-        };
-        bool intel_present = check_intel("/sys/class/drm/card0/device/vendor") ||
-                             check_intel("/sys/class/drm/card1/device/vendor");
-        if (intel_present) {
-          BOOST_LOG(info) << "[pipewire] Hybrid GPU system detected (Intel + discrete) - CUDA will use memory buffers"sv;
-          display_is_nvidia = false;
-        } else {
-          // No Intel GPU found, check if NVIDIA is present
-          const char *vendor = eglQueryString(egl_display.get(), EGL_VENDOR);
-          if (vendor && std::string_view(vendor).contains("NVIDIA")) {
-            BOOST_LOG(info) << "[pipewire] Pure NVIDIA system - DMA-BUF will be enabled for CUDA"sv;
-            display_is_nvidia = true;
-          }
+      auto check_intel = [](const std::string &path) {
+        if (std::ifstream file(path); file.good()) {
+          std::string vendor;
+          file >> vendor;
+          return vendor == "0x8086";
+        }
+        return false;
+      };
+      bool intel_present = false;
+      for (int card = 0; card < 16 && !intel_present; ++card) {
+        intel_present = check_intel(std::format("/sys/class/drm/card{}/device/vendor", card));
+      }
+      if (intel_present) {
+        BOOST_LOG(info) << "[pipewire] Hybrid GPU system detected (Intel + discrete) - NVIDIA DMA-BUF import disabled"sv;
+      } else {
+        const char *vendor = eglQueryString(egl_display.get(), EGL_VENDOR);
+        display_is_nvidia = vendor && std::string_view(vendor).contains("NVIDIA");
+        if (display_is_nvidia) {
+          BOOST_LOG(info) << "[pipewire] NVIDIA display detected - DMA-BUF import enabled"sv;
         }
       }
 

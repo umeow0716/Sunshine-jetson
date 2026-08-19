@@ -910,7 +910,8 @@ namespace platf {
    * @return X11 display backend, or nullptr when initialization fails.
    */
   std::shared_ptr<display_t> x11_display(platf::mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
-    if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::vaapi && hwdevice_type != platf::mem_type_e::cuda) {
+    if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::vaapi &&
+        hwdevice_type != platf::mem_type_e::cuda && hwdevice_type != platf::mem_type_e::nvmm) {
       BOOST_LOG(error) << "Could not initialize x11 display with the given hw device type"sv;
       return nullptr;
     }
@@ -1063,6 +1064,9 @@ namespace platf {
      * @brief Open and initialize the display connection used for capture.
      */
     xdisplay_t make_display() {
+      if (platf::load_x11()) {
+        return nullptr;
+      }
       return OpenDisplay(nullptr);
     }
 

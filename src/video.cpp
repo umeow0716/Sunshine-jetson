@@ -32,6 +32,7 @@ extern "C" {
 #include "input.h"
 #ifdef SUNSHINE_BUILD_JETSON
   #include "jetson/jetson_encoder.h"
+  #include "platform/linux/graphics.h"
 #endif
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
@@ -597,7 +598,7 @@ namespace video {
 
 #ifdef SUNSHINE_BUILD_JETSON
   /**
-   * @brief Jetson GStreamer encode session and system-memory conversion state.
+   * @brief Jetson GStreamer encode session with DMA-BUF and system-memory conversion state.
    */
   class jetson_encode_session_t: public encode_session_t {
   public:
@@ -624,9 +625,75 @@ namespace video {
      * @brief Convert a captured image to the raw Jetson input format.
      *
      * @param img Captured image supplied by the display backend.
-     * @return Zero when software color conversion succeeds.
+     * @return Zero when DMA-BUF import or software color conversion succeeds.
      */
     int convert(platf::img_t &img) override {
+  #ifdef SUNSHINE_BUILD_JETSON_VIC
+      if (encoder.supports_vic()) {
+        if (auto *descriptor = dynamic_cast<egl::img_descriptor_t *>(&img); descriptor && descriptor->sd.fds[0] >= 0) {
+          constexpr std::uint32_t drm_xrgb8888 = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);  ///< DRM XRGB8888 fourcc.
+          constexpr std::uint32_t drm_argb8888 = 'A' | ('R' << 8) | ('2' << 16) | ('4' << 24);  ///< DRM ARGB8888 fourcc.
+          constexpr std::uint32_t drm_xbgr8888 = 'X' | ('B' << 8) | ('2' << 16) | ('4' << 24);  ///< DRM XBGR8888 fourcc.
+          constexpr std::uint32_t drm_abgr8888 = 'A' | ('B' << 8) | ('2' << 16) | ('4' << 24);  ///< DRM ABGR8888 fourcc.
+          std::optional<::jetson::dmabuf_pixel_format_e> pixel_format;
+          switch (descriptor->sd.fourcc) {
+            case drm_xrgb8888:
+              pixel_format = ::jetson::dmabuf_pixel_format_e::bgrx;
+              break;
+            case drm_argb8888:
+              pixel_format = ::jetson::dmabuf_pixel_format_e::bgra;
+              break;
+            case drm_xbgr8888:
+              pixel_format = ::jetson::dmabuf_pixel_format_e::rgbx;
+              break;
+            case drm_abgr8888:
+              pixel_format = ::jetson::dmabuf_pixel_format_e::rgba;
+              break;
+          }
+          if (!pixel_format) {
+            BOOST_LOG(error) << "Jetson VIC does not support capture DMA-BUF fourcc " << descriptor->sd.fourcc;
+            vic_frame_active = false;
+            return -1;
+          }
+          const ::jetson::dmabuf_frame_view_t frame {
+            descriptor->sd.fds[0],
+            descriptor->sd.width,
+            descriptor->sd.height,
+            descriptor->sd.pitches[0],
+            descriptor->sd.offsets[0],
+            descriptor->sd.modifier,
+            *pixel_format,
+            descriptor->y_invert,
+          };
+          if (encoder.prepare_dmabuf(frame)) {
+            if (!dmabuf_path_logged) {
+              BOOST_LOG(info) << "Jetson capture input path: DMA-BUF through VIC";
+              dmabuf_path_logged = true;
+            }
+            vic_frame_active = true;
+            return 0;
+          }
+          BOOST_LOG(error) << "Could not import capture DMA-BUF into Jetson VIC: " << encoder.last_error();
+          vic_frame_active = false;
+          return -1;
+        }
+
+        const auto pixel_pitch = img.pixel_pitch > 0 ? img.pixel_pitch : (img.row_pitch / std::max(img.width, 1));
+        if (img.data && pixel_pitch == 4) {
+          const ::jetson::bgrx_frame_view_t frame {
+            img.data,
+            img.width,
+            img.height,
+            img.row_pitch,
+          };
+          if (encoder.prepare_bgrx(frame)) {
+            vic_frame_active = true;
+            return 0;
+          }
+        }
+      }
+  #endif
+      vic_frame_active = false;
       return device ? device->convert(img) : -1;
     }
 
@@ -661,6 +728,11 @@ namespace video {
      * @return Encoded Annex-B access unit, or no value on failure.
      */
     std::optional<::jetson::encoded_frame_t> encode_frame(std::uint64_t frame_index) {
+      if (vic_frame_active) {
+        auto result = encoder.encode_prepared(frame_index, force_idr);
+        force_idr = false;
+        return result;
+      }
       if (!device || !device->frame) {
         return std::nullopt;
       }
@@ -685,10 +757,30 @@ namespace video {
       return encoder.last_error();
     }
 
+    /**
+     * @brief Report whether the encoder is using direct NVMM input.
+     *
+     * @return True when the GStreamer pipeline bypasses `nvvidconv`.
+     */
+    bool uses_nvmm() const {
+      return encoder.uses_nvmm();
+    }
+
+    /**
+     * @brief Report whether packed captures can use VIC color conversion.
+     *
+     * @return True when VIC and direct NVMM input are active.
+     */
+    bool supports_vic() const {
+      return encoder.supports_vic();
+    }
+
   private:
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Software raw-frame conversion device.
     ::jetson::encoder_t encoder;  ///< GStreamer Jetson hardware encoder.
     bool force_idr = false;  ///< Whether the next submitted frame must be an IDR picture.
+    bool vic_frame_active = false;  ///< Whether repeated frames should use the retained VIC source.
+    bool dmabuf_path_logged = false;  ///< Whether the active accelerator-only capture path was logged.
   };
 #endif
 
@@ -2484,7 +2576,7 @@ namespace video {
    * @param config Client video configuration negotiated for this stream.
    * @param width Captured input width before Sunshine scaling.
    * @param height Captured input height before Sunshine scaling.
-   * @param encode_device Display-provided software conversion placeholder.
+   * @param encode_device Display-provided conversion placeholder used for CPU fallback.
    * @return Started Jetson session, or null when the mode is unsupported.
    */
   std::unique_ptr<jetson_encode_session_t> make_jetson_encode_session(
@@ -2502,7 +2594,7 @@ namespace video {
       return nullptr;
     }
     if (!encode_device || encode_device->data) {
-      BOOST_LOG(error) << "Jetson encoder requires a system-memory capture conversion device";
+      BOOST_LOG(error) << "Jetson encoder requires an AVCodec conversion placeholder";
       return nullptr;
     }
 
@@ -2572,6 +2664,10 @@ namespace video {
     if (!session->start(pipeline_config)) {
       BOOST_LOG(error) << "Could not start Jetson encoder: " << session->last_error();
       return nullptr;
+    }
+    BOOST_LOG(info) << "Jetson encoder input path: " << (session->uses_nvmm() ? "direct NVMM" : "system memory through nvvidconv");
+    if (session->supports_vic()) {
+      BOOST_LOG(info) << "Jetson packed-frame converter: VIC";
     }
     return session;
   }

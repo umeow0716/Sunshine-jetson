@@ -286,14 +286,18 @@ namespace video {
 
 #ifdef SUNSHINE_BUILD_JETSON
   /**
-   * @brief System-memory pixel formats accepted by the Jetson GStreamer backend.
+   * @brief DMA-BUF-capable pixel formats accepted by the Jetson GStreamer backend.
    */
   struct encoder_platform_formats_jetson: encoder_platform_formats_t {
     /**
      * @brief Construct the fixed NV12 and P010 mappings used on Jetson.
      */
     encoder_platform_formats_jetson() {
+  #ifdef SUNSHINE_BUILD_JETSON_VIC
+      dev_type = platf::mem_type_e::nvmm;
+  #else
       dev_type = platf::mem_type_e::system;
+  #endif
       pix_fmt_8bit = platf::pix_fmt_e::nv12;
       pix_fmt_10bit = platf::pix_fmt_e::p010;
       pix_fmt_yuv444_8bit = platf::pix_fmt_e::unknown;

@@ -505,12 +505,13 @@ namespace platf {
    * @brief Create a Wayland capture backend for the requested memory type.
    */
   std::shared_ptr<display_t> wl_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
-    if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::vaapi && hwdevice_type != platf::mem_type_e::cuda) {
+    if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::vaapi &&
+        hwdevice_type != platf::mem_type_e::cuda && hwdevice_type != platf::mem_type_e::nvmm) {
       BOOST_LOG(error) << "[wlgrab] Could not initialize display with the given hw device type."sv;
       return nullptr;
     }
 
-    if (hwdevice_type == platf::mem_type_e::vaapi || hwdevice_type == platf::mem_type_e::cuda) {
+    if (hwdevice_type == platf::mem_type_e::vaapi || hwdevice_type == platf::mem_type_e::cuda || hwdevice_type == platf::mem_type_e::nvmm) {
       auto wlr = std::make_shared<wl::wlr_vram_t>();
       if (wlr->init(hwdevice_type, display_name, config)) {
         return nullptr;

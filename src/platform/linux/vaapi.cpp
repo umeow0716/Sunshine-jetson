@@ -31,26 +31,6 @@ extern "C" {
     return VA_STATUS_ERROR_UNIMPLEMENTED;
   }
 #endif
-#if !VA_CHECK_VERSION(1, 21, 0)
-  /**
-   * @brief Stub vaMapBuffer2 when building against libva before 2.21.0.
-   *
-   * @param dpy VA display.
-   * @param buf_id VA buffer ID.
-   * @param pbuf Output mapped buffer pointer.
-   * @param flags Mapping flags.
-   * @return VA status code.
-   */
-  VAStatus
-    vaMapBuffer2(
-      VADisplay dpy,
-      VABufferID buf_id,
-      void **pbuf,
-      uint32_t flags
-    ) {
-    return vaMapBuffer(dpy, buf_id, pbuf);
-  }
-#endif
 }
 
 // local includes

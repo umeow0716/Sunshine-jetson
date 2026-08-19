@@ -9,11 +9,15 @@
   #include <algorithm>
   #include <array>
   #include <cstdint>
+  #include <memory>
   #include <utility>
   #include <vector>
 
   // lib includes
   #include <gtest/gtest.h>
+  #ifdef SUNSHINE_BUILD_JETSON_VIC
+    #include <nvbufsurface.h>
+  #endif
 
   // local includes
   #include "src/jetson/jetson_encoder.h"
@@ -100,6 +104,16 @@ TEST(JetsonEncoderTest, RejectsInvalidPipelineConfiguration) {
 TEST(JetsonEncoderTest, RejectsFrameBeforePipelineStarts) {
   jetson::encoder_t encoder;
   const jetson::frame_view_t frame {nullptr, nullptr, 0, 0};
+  const jetson::bgrx_frame_view_t bgrx {nullptr, 0, 0, 0};
+  const jetson::dmabuf_frame_view_t dmabuf {-1, 0, 0, 0, 0, 0, jetson::dmabuf_pixel_format_e::bgrx, false};
+  EXPECT_FALSE(encoder.uses_nvmm());
+  EXPECT_FALSE(encoder.supports_vic());
+  EXPECT_FALSE(encoder.prepare_bgrx(bgrx));
+  EXPECT_EQ(encoder.last_error(), "Jetson GStreamer pipeline is not running");
+  EXPECT_FALSE(encoder.prepare_dmabuf(dmabuf));
+  EXPECT_EQ(encoder.last_error(), "Jetson GStreamer pipeline is not running");
+  EXPECT_FALSE(encoder.encode_prepared(0, false).has_value());
+  EXPECT_EQ(encoder.last_error(), "Jetson GStreamer pipeline is not running");
   EXPECT_FALSE(encoder.encode(frame, 0, false).has_value());
   EXPECT_EQ(encoder.last_error(), "Jetson GStreamer pipeline is not running");
 }
@@ -139,6 +153,11 @@ TEST(JetsonEncoderTest, EncodesSupportedFormatsOnAvailableJetsonHardware) {
       false,
     };
     ASSERT_TRUE(encoder.start(config)) << encoder.last_error();
+  #ifdef SUNSHINE_BUILD_JETSON_NVMM
+    EXPECT_TRUE(encoder.uses_nvmm());
+  #else
+    EXPECT_FALSE(encoder.uses_nvmm());
+  #endif
 
     const jetson::frame_view_t frame {
       raw_frame.data(),
@@ -151,6 +170,66 @@ TEST(JetsonEncoderTest, EncodesSupportedFormatsOnAvailableJetsonHardware) {
     EXPECT_FALSE(encoded->data.empty());
     EXPECT_EQ(encoded->frame_index, 0U);
     EXPECT_TRUE(encoded->idr);
+
+  #ifdef SUNSHINE_BUILD_JETSON_VIC
+    EXPECT_TRUE(encoder.supports_vic());
+    constexpr int source_width = 640;
+    constexpr int source_height = 360;
+    std::vector<std::uint8_t> bgrx_frame(static_cast<std::size_t>(source_width) * source_height * 4, 0x40);
+    const jetson::bgrx_frame_view_t bgrx {
+      bgrx_frame.data(),
+      source_width,
+      source_height,
+      source_width * 4,
+    };
+    ASSERT_TRUE(encoder.prepare_bgrx(bgrx)) << encoder.last_error();
+    for (std::uint64_t frame_index = 1; frame_index <= 6; ++frame_index) {
+      const auto vic_encoded = encoder.encode_prepared(frame_index, frame_index == 4);
+      ASSERT_TRUE(vic_encoded.has_value()) << encoder.last_error();
+      EXPECT_FALSE(vic_encoded->data.empty());
+      EXPECT_EQ(vic_encoded->frame_index, frame_index);
+      if (frame_index == 4) {
+        EXPECT_TRUE(vic_encoded->idr);
+      }
+    }
+
+    NvBufSurfaceCreateParams source_params {};
+    source_params.gpuId = 0;
+    source_params.width = source_width;
+    source_params.height = source_height;
+    source_params.colorFormat = NVBUF_COLOR_FORMAT_BGRx;
+    source_params.layout = NVBUF_LAYOUT_BLOCK_LINEAR;
+    source_params.memType = NVBUF_MEM_SURFACE_ARRAY;
+    NvBufSurface *source = nullptr;
+    ASSERT_EQ(NvBufSurfaceCreate(&source, 1, &source_params), 0);
+    ASSERT_NE(source, nullptr);
+    std::unique_ptr<NvBufSurface, decltype(&NvBufSurfaceDestroy)> source_owner {source, &NvBufSurfaceDestroy};
+    source->numFilled = 1;
+    ASSERT_EQ(NvBufSurfaceMemSet(source, 0, 0, 0x40), 0);
+
+    NvBufSurfaceMapParams map_params {};
+    ASSERT_EQ(NvBufSurfaceGetMapParams(source, 0, &map_params), 0);
+    const auto modifier = source->surfaceList[0].layout == NVBUF_LAYOUT_PITCH ? 0U :
+                                                                                0x10U | map_params.planes[0].blockheightlog2;
+    const jetson::dmabuf_frame_view_t dmabuf {
+      static_cast<int>(source->surfaceList[0].bufferDesc),
+      source_width,
+      source_height,
+      map_params.planes[0].pitch,
+      map_params.planes[0].offset,
+      modifier,
+      jetson::dmabuf_pixel_format_e::bgrx,
+      true,
+    };
+    ASSERT_TRUE(encoder.prepare_dmabuf(dmabuf)) << encoder.last_error();
+    const auto dmabuf_encoded = encoder.encode_prepared(7, false);
+    EXPECT_EQ(NvBufSurfaceDestroy(source_owner.release()), 0);
+    ASSERT_TRUE(dmabuf_encoded.has_value()) << encoder.last_error();
+    EXPECT_FALSE(dmabuf_encoded->data.empty());
+    EXPECT_EQ(dmabuf_encoded->frame_index, 7U);
+  #else
+    EXPECT_FALSE(encoder.supports_vic());
+  #endif
   }
 }
 
