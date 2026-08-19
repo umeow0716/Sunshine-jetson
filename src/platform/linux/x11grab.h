@@ -20,6 +20,16 @@ namespace egl {
 
 namespace platf::x11 {
   struct cursor_ctx_raw_t;
+
+  /**
+   * @brief Check whether an XRandR output can be selected for capture.
+   *
+   * @param connection XRandR connection state.
+   * @param crtc Active CRTC identifier, or zero when no mode is assigned.
+   * @return True when the output is connected and has an active CRTC.
+   */
+  bool output_is_usable(int connection, unsigned long crtc);
+
   /**
    * @brief Release cursor context resources.
    *

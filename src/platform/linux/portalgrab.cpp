@@ -8,7 +8,7 @@
 namespace {
   // Portal configuration constants
   constexpr uint32_t SOURCE_TYPE_MONITOR = 1;
-  constexpr uint32_t CURSOR_MODE_EMBEDDED = 2;
+  constexpr uint32_t CURSOR_MODE_METADATA = 4;
 
   constexpr uint32_t PERSIST_FORGET = 0;
   constexpr uint32_t PERSIST_WHILE_RUNNING = 1;
@@ -479,7 +479,7 @@ namespace portal {
       g_variant_builder_open(&builder, G_VARIANT_TYPE("a{sv}"));
       g_variant_builder_add(&builder, "{sv}", "handle_token", g_variant_new_string(request_token));
       g_variant_builder_add(&builder, "{sv}", "types", g_variant_new_uint32(SOURCE_TYPE_MONITOR));
-      g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(CURSOR_MODE_EMBEDDED));
+      g_variant_builder_add(&builder, "{sv}", "cursor_mode", g_variant_new_uint32(CURSOR_MODE_METADATA));
       g_variant_builder_add(&builder, "{sv}", "multiple", g_variant_new_boolean(TRUE));
       if (persist) {
         g_variant_builder_add(&builder, "{sv}", "persist_mode", g_variant_new_uint32(PERSIST_UNTIL_REVOKED));

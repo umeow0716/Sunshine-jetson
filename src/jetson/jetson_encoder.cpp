@@ -634,12 +634,15 @@ namespace {
       NvBufSurfTransformConfigParams session {};
       session.compute_mode = NvBufSurfTransformCompute_VIC;
       NvBufSurfTransformParams transform {};
-      transform.transform_flag = NVBUFSURF_TRANSFORM_CROP_SRC | NVBUFSURF_TRANSFORM_CROP_DST | NVBUFSURF_TRANSFORM_FILTER;
+      transform.transform_flag = NVBUFSURF_TRANSFORM_CROP_SRC | NVBUFSURF_TRANSFORM_CROP_DST;
       if (flip_y_) {
         transform.transform_flag |= NVBUFSURF_TRANSFORM_FLIP;
         transform.transform_flip = NvBufSurfTransform_FlipY;
       }
-      transform.transform_filter = NvBufSurfTransformInter_Algo3;
+      if (scaled_width != width_ || scaled_height != height_) {
+        transform.transform_flag |= NVBUFSURF_TRANSFORM_FILTER;
+        transform.transform_filter = NvBufSurfTransformInter_Bilinear;
+      }
       transform.src_rect = &source_rect;
       transform.dst_rect = &destination_rect;
 
@@ -1090,9 +1093,12 @@ namespace jetson {
         "block",
         TRUE,
         "max-bytes",
-        frame_bytes * 8,
+        frame_bytes,
         nullptr
       );
+      if (g_object_class_find_property(G_OBJECT_GET_CLASS(impl_->source), "max-buffers")) {
+        g_object_set(impl_->source, "max-buffers", static_cast<guint64>(1), nullptr);
+      }
 
       const auto reference_frames = std::clamp(config.reference_frames, 1U, 8U);
       const auto frames_per_second = std::max(1U, static_cast<std::uint32_t>(config.framerate_numerator / config.framerate_denominator));
@@ -1125,6 +1131,8 @@ namespace jetson {
         config.full_range,
         "maxperf-enable",
         TRUE,
+        "vbv-size",
+        1U,
         nullptr
       );
       g_object_set(impl_->hardware_encoder, "profile", config.codec == codec_e::h264 ? 4 : (config.pixel_format == pixel_format_e::p010 ? 1 : 0), nullptr);

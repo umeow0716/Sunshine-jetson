@@ -17,6 +17,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "pipewire_cursor.h"
 #include "src/main.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -91,6 +92,16 @@ namespace pipewire {
   };
 
   /**
+   * @brief Metadata copied from the latest PipeWire event.
+   */
+  struct frame_metadata_t {
+    std::optional<std::uint64_t> pts;  ///< PipeWire presentation timestamp.
+    std::optional<std::uint64_t> seq;  ///< PipeWire frame sequence number.
+    std::optional<bool> damage;  ///< Whether PipeWire reported non-empty video damage.
+    std::optional<std::uint32_t> flags;  ///< PipeWire chunk flags.
+  };
+
+  /**
    * @brief PipeWire stream handle, format, and shared state pointer.
    */
   struct stream_data_t {
@@ -104,6 +115,8 @@ namespace pipewire {
     std::condition_variable frame_cv;  ///< Signals arrival or release of a PipeWire frame.
     size_t local_stride = 0;  ///< Local stride.
     bool frame_ready = false;  ///< Whether a PipeWire frame is ready to consume.
+    frame_metadata_t frame_metadata;  ///< Metadata for the latest frame or cursor event.
+    cursor::state_t cursor;  ///< Persistent cursor bitmap and position from PipeWire metadata.
     // Two distinct memory pools
     std::vector<uint8_t> buffer_a;  ///< First staging buffer used for CPU-copy PipeWire frames.
     std::vector<uint8_t> buffer_b;  ///< Second staging buffer used for CPU-copy PipeWire frames.
@@ -131,9 +144,13 @@ namespace pipewire {
    */
   struct img_descriptor_t: public egl::img_descriptor_t {
     ~img_descriptor_t() override {
-      // Only free buffers this image actually owns. The memory-buffer capture
-      // path points img->data at the PipeWire staging vector (front_buffer),
-      // which is owned by pipewire_t -- deleting it here corrupts the heap.
+      release_owned_data();
+    }
+
+    /**
+     * @brief Release a fallback image allocation before exposing captured data.
+     */
+    void release_owned_data() {
       if (data && data_owned) {
         delete[] data;
       }
@@ -375,30 +392,70 @@ namespace pipewire {
     }
 
     /**
-     * @brief Copy PipeWire metadata into the Sunshine image descriptor.
+     * @brief Copy frame metadata out of a PipeWire buffer before it is returned.
      *
-     * @param img_descriptor Image descriptor receiving timestamps, sequence, and damage flags.
-     * @param buf Raw byte buffer used for serialization.
+     * @param buf PipeWire buffer containing metadata.
+     * @return Metadata safe to retain after the PipeWire buffer is queued again.
      */
-    static void fill_img_metadata(egl::img_descriptor_t *img_descriptor, struct spa_buffer *buf) {
-      img_descriptor->frame_timestamp = std::chrono::steady_clock::now();
-
+    static frame_metadata_t read_frame_metadata(struct spa_buffer *buf) {
+      frame_metadata_t metadata;
       struct spa_meta_header *h = static_cast<struct spa_meta_header *>(
         spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*h))
       );
       if (h) {
-        img_descriptor->seq = h->seq;
-        img_descriptor->pts = h->pts;
+        metadata.seq = h->seq;
+        metadata.pts = h->pts;
       }
 
       if (buf->n_datas > 0) {
-        img_descriptor->pw_flags = buf->datas[0].chunk->flags;
+        metadata.flags = buf->datas[0].chunk->flags;
       }
 
       struct spa_meta_region *damage = static_cast<struct spa_meta_region *>(
         spa_buffer_find_meta_data(buf, SPA_META_VideoDamage, sizeof(*damage))
       );
-      img_descriptor->pw_damage = (damage && damage->region.size.width > 0 && damage->region.size.height > 0) ? std::optional<bool>(true) : std::nullopt;
+      metadata.damage = (damage && damage->region.size.width > 0 && damage->region.size.height > 0) ? std::optional<bool>(true) : std::nullopt;
+      return metadata;
+    }
+
+    /**
+     * @brief Copy retained PipeWire metadata into a Sunshine image descriptor.
+     *
+     * @param img_descriptor Image descriptor receiving timestamps, sequence, and damage flags.
+     * @param metadata Retained PipeWire metadata.
+     */
+    static void fill_img_metadata(egl::img_descriptor_t *img_descriptor, const frame_metadata_t &metadata) {
+      img_descriptor->frame_timestamp = std::chrono::steady_clock::now();
+      img_descriptor->seq = metadata.seq;
+      img_descriptor->pts = metadata.pts;
+      img_descriptor->pw_flags = metadata.flags;
+      img_descriptor->pw_damage = metadata.damage;
+    }
+
+    /**
+     * @brief Attach retained cursor state to a DMA-BUF image descriptor.
+     *
+     * @param img_descriptor Image descriptor receiving cursor pixels and placement.
+     * @param state Retained normalized cursor state.
+     * @param show_cursor Whether the caller requested cursor display.
+     */
+    static void fill_img_cursor(egl::img_descriptor_t *img_descriptor, const cursor::state_t &state, bool show_cursor) {
+      if (!show_cursor || !state.visible || state.pixels.empty()) {
+        img_descriptor->data = nullptr;
+        return;
+      }
+
+      if (img_descriptor->serial != state.serial || img_descriptor->buffer.size() != state.pixels.size()) {
+        img_descriptor->buffer = state.pixels;
+        img_descriptor->serial = state.serial;
+      }
+      img_descriptor->data = img_descriptor->buffer.data();
+      img_descriptor->x = state.x;
+      img_descriptor->y = state.y;
+      img_descriptor->width = img_descriptor->src_w = static_cast<int>(state.width);
+      img_descriptor->height = img_descriptor->src_h = static_cast<int>(state.height);
+      img_descriptor->pixel_pitch = 4;
+      img_descriptor->row_pitch = img_descriptor->pixel_pitch * img_descriptor->width;
     }
 
     /**
@@ -424,10 +481,14 @@ namespace pipewire {
      * @brief Copy the latest PipeWire frame into Sunshine's image buffer.
      *
      * @param img Image or frame object to read from or populate.
+     * @param show_cursor Whether the cursor should be included in the captured image.
      */
-    void fill_img(platf::img_t *img) {
+    void fill_img(platf::img_t *img, bool show_cursor) {
       pw_thread_loop_lock(loop);
       std::scoped_lock lock(stream_data.frame_mutex);
+
+      auto *img_descriptor = static_cast<img_descriptor_t *>(img);
+      img_descriptor->release_owned_data();
 
       if (stream_data.shared && stream_data.shared->stream_dead.load()) {
         img->data = nullptr;
@@ -436,25 +497,40 @@ namespace pipewire {
         return;
       }
 
-      if (!stream_data.current_buffer) {
+      const auto has_dmabuf = stream_data.current_buffer &&
+                              stream_data.current_buffer->buffer->n_datas > 0 &&
+                              stream_data.current_buffer->buffer->datas[0].type == SPA_DATA_DmaBuf;
+      const auto has_memory = !stream_data.front_buffer->empty();
+      if (!has_dmabuf && !has_memory) {
         img->data = nullptr;
         pw_thread_loop_unlock(loop);
         return;
       }
 
-      struct spa_buffer *buf = stream_data.current_buffer->buffer;
-      if (buf->datas[0].chunk->size != 0) {
-        auto *img_descriptor = static_cast<img_descriptor_t *>(img);
-        fill_img_metadata(img_descriptor, buf);
-        if (buf->datas[0].type == SPA_DATA_DmaBuf) {
-          fill_img_dmabuf(img_descriptor, buf, stream_data);
+      fill_img_metadata(img_descriptor, stream_data.frame_metadata);
+      if (has_dmabuf) {
+        fill_img_dmabuf(img_descriptor, stream_data.current_buffer->buffer, stream_data);
+        fill_img_cursor(img_descriptor, stream_data.cursor, show_cursor);
+      } else {
+        img_descriptor->data_owned = false;
+        img->row_pitch = stream_data.local_stride;
+        // NV12 is the only 1-byte-per-pixel format delivered on the memory
+        // path; every other negotiated format is packed 4 bytes per pixel.
+        img->pixel_pitch = (stream_data.format.info.raw.format == SPA_VIDEO_FORMAT_NV12) ? 1 : 4;
+
+        if (show_cursor && stream_data.cursor.visible) {
+          img_descriptor->buffer = *stream_data.front_buffer;
+          cursor::blend(
+            stream_data.cursor,
+            img_descriptor->buffer,
+            stream_data.format.info.raw.size.width,
+            stream_data.format.info.raw.size.height,
+            static_cast<std::int32_t>(stream_data.local_stride),
+            stream_data.format.info.raw.format
+          );
+          img->data = img_descriptor->buffer.data();
         } else {
           img->data = stream_data.front_buffer->data();
-          img_descriptor->data_owned = false;
-          img->row_pitch = stream_data.local_stride;
-          // NV12 is the only 1-byte-per-pixel format delivered on the memory
-          // path; every other negotiated format is packed 4 bytes per pixel.
-          img->pixel_pitch = (stream_data.format.info.raw.format == SPA_VIDEO_FORMAT_NV12) ? 1 : 4;
         }
       }
 
@@ -587,54 +663,97 @@ namespace pipewire {
 
     static void on_process(void *user_data) {
       const auto d = static_cast<struct stream_data_t *>(user_data);
-      struct pw_buffer *b = nullptr;
-
-      // 1. Drain the queue: Always grab the most recent buffer
+      std::vector<struct pw_buffer *> buffers;
       while (struct pw_buffer *aux = pw_stream_dequeue_buffer(d->stream)) {
-        if (b) {
-          pw_stream_queue_buffer(d->stream, b);  // Return the older, unused buffer
-        }
-        b = aux;
+        buffers.push_back(aux);
       }
 
-      if (!b) {
+      if (buffers.empty()) {
         return;
       }
 
-      // 2. Fast Path: DMA-BUF
-      if (b->buffer->datas[0].type == SPA_DATA_DmaBuf) {
-        std::scoped_lock lock(d->frame_mutex);
-        if (d->current_buffer) {
-          pw_stream_queue_buffer(d->stream, d->current_buffer);
+      // Keep the newest complete, supported frame while still processing cursor
+      // metadata from every dequeued event in chronological order.
+      struct pw_buffer *latest_frame = nullptr;
+      for (auto *candidate : buffers) {
+        auto *buffer = candidate->buffer;
+        if (buffer->n_datas == 0 || !buffer->datas[0].chunk || buffer->datas[0].chunk->size == 0) {
+          continue;
         }
-        d->current_buffer = b;
-        d->frame_ready = true;
+        if (buffer->datas[0].type == SPA_DATA_DmaBuf || buffer->datas[0].data != nullptr) {
+          latest_frame = candidate;
+        }
       }
-      // 3. Optimized Path: Software/MemPtr
-      else if (b->buffer->datas[0].data != nullptr) {
-        size_t size = b->buffer->datas[0].chunk->size;
 
-        // Perform the copy to the BACK buffer while NOT holding the lock
-        if (d->back_buffer->size() < size) {
+      // Copy memory-backed pixels before taking the consumer lock. PipeWire owns
+      // the source until all dequeued buffers are returned below.
+      if (latest_frame && latest_frame->buffer->datas[0].type != SPA_DATA_DmaBuf) {
+        const auto *data = &latest_frame->buffer->datas[0];
+        const auto size = static_cast<std::size_t>(data->chunk->size);
+        if (d->back_buffer->size() != size) {
           d->back_buffer->resize(size);
         }
-        std::memcpy(d->back_buffer->data(), b->buffer->datas[0].data, size);
-
-        {
-          // Lock only for the pointer swap and state update
-          std::scoped_lock lock(d->frame_mutex);
-          std::swap(d->front_buffer, d->back_buffer);
-
-          d->local_stride = b->buffer->datas[0].chunk->stride;
-          d->frame_ready = true;
-          d->current_buffer = b;
-        }
-
-        // Release the PW buffer immediately after copy
-        pw_stream_queue_buffer(d->stream, b);
+        std::memcpy(d->back_buffer->data(), data->data, size);
       }
 
-      d->frame_cv.notify_one();
+      bool notify_capture = false;
+      {
+        std::scoped_lock lock(d->frame_mutex);
+
+        bool cursor_changed = false;
+        for (auto *candidate : buffers) {
+          auto *buffer = candidate->buffer;
+          if (buffer->n_datas == 0 || !buffer->datas[0].chunk) {
+            continue;
+          }
+
+          const auto cursor_update = cursor::update(d->cursor, spa_buffer_find_meta(buffer, SPA_META_Cursor));
+          const auto event_changed = cursor_update != cursor::update_e::none && cursor_update != cursor::update_e::invalid;
+          cursor_changed = cursor_changed || event_changed;
+
+          if (buffer->datas[0].chunk->size != 0 || event_changed) {
+            d->frame_metadata = read_frame_metadata(buffer);
+          }
+        }
+
+        if (cursor_changed) {
+          // Cursor-only events may reuse the previous PTS and report no video
+          // damage. Mark the final event changed so duplicate filtering emits it.
+          d->frame_metadata.damage = true;
+        }
+
+        if (latest_frame && latest_frame->buffer->datas[0].type == SPA_DATA_DmaBuf) {
+          if (d->current_buffer) {
+            pw_stream_queue_buffer(d->stream, d->current_buffer);
+          }
+          d->current_buffer = latest_frame;
+        } else if (latest_frame) {
+          if (d->current_buffer) {
+            pw_stream_queue_buffer(d->stream, d->current_buffer);
+            d->current_buffer = nullptr;
+          }
+          std::swap(d->front_buffer, d->back_buffer);
+          d->local_stride = latest_frame->buffer->datas[0].chunk->stride;
+        }
+
+        const auto event_available = latest_frame || cursor_changed;
+        notify_capture = event_available && (d->current_buffer || !d->front_buffer->empty());
+        if (event_available) {
+          d->frame_ready = d->frame_ready || notify_capture;
+        }
+      }
+
+      // DMA-BUF frames remain retained until fill_img duplicates their fds. Every
+      // other event can be returned immediately after metadata and pixels are copied.
+      for (auto *candidate : buffers) {
+        if (!latest_frame || latest_frame->buffer->datas[0].type != SPA_DATA_DmaBuf || candidate != latest_frame) {
+          pw_stream_queue_buffer(d->stream, candidate);
+        }
+      }
+
+      if (notify_capture) {
+        d->frame_cv.notify_one();
+      }
     }
 
     static void on_param_changed(void *user_data, uint32_t id, const struct spa_pod *param) {
@@ -705,7 +824,7 @@ namespace pipewire {
 
       // Ack the buffer type and metadata
       std::array<uint8_t, SPA_POD_BUFFER_SIZE> buffer;
-      std::array<const struct spa_pod *, 3> params;
+      std::array<const struct spa_pod *, 4> params;
       int n_params = 0;
       struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer.data(), buffer.size());
       auto buffer_param = static_cast<const struct spa_pod *>(spa_pod_builder_add_object(&pod_builder, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers, SPA_PARAM_BUFFERS_dataType, SPA_POD_Int(buffer_types)));
@@ -717,6 +836,21 @@ namespace pipewire {
       int videoDamageRegionCount = 16;
       auto damage_param = static_cast<const struct spa_pod *>(spa_pod_builder_add_object(&pod_builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage), SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(sizeof(struct spa_meta_region) * videoDamageRegionCount, sizeof(struct spa_meta_region) * 1, sizeof(struct spa_meta_region) * videoDamageRegionCount)));
       params[n_params] = damage_param;
+      n_params++;
+      auto cursor_param = static_cast<const struct spa_pod *>(spa_pod_builder_add_object(
+        &pod_builder,
+        SPA_TYPE_OBJECT_ParamMeta,
+        SPA_PARAM_Meta,
+        SPA_PARAM_META_type,
+        SPA_POD_Id(SPA_META_Cursor),
+        SPA_PARAM_META_size,
+        SPA_POD_CHOICE_RANGE_Int(
+          static_cast<int>(cursor::metadata_size(64, 64)),
+          static_cast<int>(cursor::metadata_size(1, 1)),
+          static_cast<int>(cursor::metadata_size(cursor::max_dimension, cursor::max_dimension))
+        )
+      ));
+      params[n_params] = cursor_param;
       n_params++;
 
       pw_stream_update_params(d->stream, params.data(), n_params);
@@ -910,7 +1044,6 @@ namespace pipewire {
      * @return Capture status reported to the streaming pipeline.
      */
     platf::capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool show_cursor) {
-      // FIXME: show_cursor is ignored
       auto deadline = std::chrono::steady_clock::now() + timeout;
       int retries = 0;
 
@@ -925,7 +1058,7 @@ namespace pipewire {
 
         auto *img_egl = static_cast<egl::img_descriptor_t *>(img_out.get());
         img_egl->reset();
-        pipewire.fill_img(img_egl);
+        pipewire.fill_img(img_egl, show_cursor);
 
         // Check if we got valid data (either DMA-BUF fd or memory pointer), then filter duplicates
         if ((img_egl->sd.fds[0] >= 0 || img_egl->data != nullptr) && !is_buffer_redundant(img_egl)) {
