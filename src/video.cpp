@@ -30,6 +30,9 @@ extern "C" {
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
+#ifdef SUNSHINE_BUILD_JETSON
+  #include "jetson/jetson_encoder.h"
+#endif
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
@@ -591,6 +594,103 @@ namespace video {
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
   };
+
+#ifdef SUNSHINE_BUILD_JETSON
+  /**
+   * @brief Jetson GStreamer encode session and system-memory conversion state.
+   */
+  class jetson_encode_session_t: public encode_session_t {
+  public:
+    /**
+     * @brief Take ownership of a software conversion device.
+     *
+     * @param encode_device Device that converts captured frames to NV12 or P010.
+     */
+    explicit jetson_encode_session_t(std::unique_ptr<platf::avcodec_encode_device_t> encode_device):
+        device {std::move(encode_device)} {
+    }
+
+    /**
+     * @brief Start the GStreamer hardware encoder.
+     *
+     * @param pipeline_config Jetson codec and stream settings.
+     * @return True when the GStreamer pipeline starts successfully.
+     */
+    bool start(const ::jetson::pipeline_config_t &pipeline_config) {
+      return encoder.start(pipeline_config);
+    }
+
+    /**
+     * @brief Convert a captured image to the raw Jetson input format.
+     *
+     * @param img Captured image supplied by the display backend.
+     * @return Zero when software color conversion succeeds.
+     */
+    int convert(platf::img_t &img) override {
+      return device ? device->convert(img) : -1;
+    }
+
+    /**
+     * @brief Request an IDR picture from the next Jetson encode call.
+     */
+    void request_idr_frame() override {
+      force_idr = true;
+    }
+
+    /**
+     * @brief Clear the pending IDR request.
+     */
+    void request_normal_frame() override {
+      force_idr = false;
+    }
+
+    /**
+     * @brief Replace reference-frame invalidation with a full IDR refresh.
+     *
+     * @param first_frame First invalid reference frame.
+     * @param last_frame Last invalid reference frame.
+     */
+    void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
+      force_idr = true;
+    }
+
+    /**
+     * @brief Encode the converted frame through GStreamer.
+     *
+     * @param frame_index Monotonic Sunshine frame index.
+     * @return Encoded Annex-B access unit, or no value on failure.
+     */
+    std::optional<::jetson::encoded_frame_t> encode_frame(std::uint64_t frame_index) {
+      if (!device || !device->frame) {
+        return std::nullopt;
+      }
+
+      const ::jetson::frame_view_t frame {
+        device->frame->data[0],
+        device->frame->data[1],
+        device->frame->linesize[0],
+        device->frame->linesize[1],
+      };
+      auto result = encoder.encode(frame, frame_index, force_idr);
+      force_idr = false;
+      return result;
+    }
+
+    /**
+     * @brief Return the latest GStreamer failure message.
+     *
+     * @return Error string owned by the Jetson encoder.
+     */
+    std::string_view last_error() const {
+      return encoder.last_error();
+    }
+
+  private:
+    std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Software raw-frame conversion device.
+    ::jetson::encoder_t encoder;  ///< GStreamer Jetson hardware encoder.
+    bool force_idr = false;  ///< Whether the next submitted frame must be an IDR picture.
+  };
+#endif
 
   /**
    * @brief Context object used while synchronizing encode sessions.
@@ -1391,9 +1491,50 @@ namespace video {
   };
 #endif
 
+#ifdef SUNSHINE_BUILD_JETSON
+  /**
+   * @brief NVIDIA Jetson hardware encoder exposed through GStreamer.
+   */
+  encoder_t jetson_gstreamer {
+    "jetson"sv,
+    std::make_unique<encoder_platform_formats_jetson>(),
+    {
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      {},  // AV1 is not exposed by the Jetson V4L2 encoder
+    },
+    {
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      "nvv4l2h265enc"s,
+    },
+    {
+      {},  // Common options
+      {},  // SDR-specific options
+      {},  // HDR-specific options
+      {},  // YUV444 SDR-specific options
+      {},  // YUV444 HDR-specific options
+      {},  // Fallback options
+      "nvv4l2h264enc"s,
+    },
+    PARALLEL_ENCODING | SINGLE_SLICE_ONLY
+  };
+#endif
+
   static const std::vector encoders {
 #ifndef __APPLE__
     &nvenc,
+#endif
+#ifdef SUNSHINE_BUILD_JETSON
+    &jetson_gstreamer,
 #endif
 #ifdef _WIN32
     &quicksync,
@@ -1872,6 +2013,32 @@ namespace video {
     return 0;
   }
 
+#ifdef SUNSHINE_BUILD_JETSON
+  /**
+   * @brief Encode one frame through the Jetson GStreamer backend.
+   *
+   * @param frame_nr Monotonic frame index assigned by the video pipeline.
+   * @param session Active Jetson encoder session.
+   * @param packets Output queue that receives the encoded access unit.
+   * @param channel_data Platform or protocol state attached to the packet.
+   * @param frame_timestamp Capture timestamp associated with the encoded frame.
+   * @return Zero when an access unit is queued; nonzero on hardware failure.
+   */
+  int encode_jetson(int64_t frame_nr, jetson_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto encoded_frame = session.encode_frame(frame_nr);
+    if (!encoded_frame) {
+      BOOST_LOG(error) << "Jetson encoder failed: " << session.last_error();
+      return -1;
+    }
+
+    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame->data), encoded_frame->frame_index, encoded_frame->idr);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+    return 0;
+  }
+#endif
+
   /**
    * @brief Encode one captured frame and queue packets for transmission.
    *
@@ -1887,6 +2054,10 @@ namespace video {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+#ifdef SUNSHINE_BUILD_JETSON
+    } else if (auto jetson_session = dynamic_cast<jetson_encode_session_t *>(&session)) {
+      return encode_jetson(frame_nr, *jetson_session, packets, channel_data, frame_timestamp);
+#endif
     }
 
     return -1;
@@ -2306,6 +2477,106 @@ namespace video {
     return std::make_unique<nvenc_encode_session_t>(std::move(encode_device));
   }
 
+#ifdef SUNSHINE_BUILD_JETSON
+  /**
+   * @brief Create a Jetson GStreamer encode session.
+   *
+   * @param config Client video configuration negotiated for this stream.
+   * @param width Captured input width before Sunshine scaling.
+   * @param height Captured input height before Sunshine scaling.
+   * @param encode_device Display-provided software conversion placeholder.
+   * @return Started Jetson session, or null when the mode is unsupported.
+   */
+  std::unique_ptr<jetson_encode_session_t> make_jetson_encode_session(
+    const config_t &config,
+    int width,
+    int height,
+    std::unique_ptr<platf::avcodec_encode_device_t> encode_device
+  ) {
+    if (config.videoFormat < 0 || config.videoFormat > 1 || config.chromaSamplingType != 0) {
+      BOOST_LOG(error) << "Jetson encoder supports only H.264 and HEVC with 4:2:0 chroma";
+      return nullptr;
+    }
+    if (config.videoFormat == 0 && config.dynamicRange) {
+      BOOST_LOG(error) << "Jetson H.264 encoder does not support 10-bit streaming";
+      return nullptr;
+    }
+    if (!encode_device || encode_device->data) {
+      BOOST_LOG(error) << "Jetson encoder requires a system-memory capture conversion device";
+      return nullptr;
+    }
+
+    const auto colorspace = encode_device->colorspace;
+    const auto pixel_format = config.dynamicRange ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
+    avcodec_frame_t frame {av_frame_alloc()};
+    if (!frame) {
+      return nullptr;
+    }
+    frame->format = pixel_format;
+    frame->width = config.width;
+    frame->height = config.height;
+
+    const auto avcodec_colorspace = avcodec_colorspace_from_sunshine_colorspace(colorspace);
+    frame->color_range = avcodec_colorspace.range;
+    frame->color_primaries = avcodec_colorspace.primaries;
+    frame->color_trc = avcodec_colorspace.transfer_function;
+    frame->colorspace = avcodec_colorspace.matrix;
+
+    auto software_device = std::make_unique<avcodec_software_encode_device_t>();
+    if (software_device->init(width, height, frame.get(), pixel_format, false)) {
+      return nullptr;
+    }
+    software_device->colorspace = colorspace;
+    if (software_device->set_frame(frame.release(), nullptr)) {
+      return nullptr;
+    }
+    software_device->apply_colorspace();
+
+    ::jetson::colorspace_e jetson_colorspace;
+    switch (colorspace.colorspace) {
+      case colorspace_e::rec601:
+        jetson_colorspace = ::jetson::colorspace_e::rec601;
+        break;
+      case colorspace_e::rec709:
+        jetson_colorspace = ::jetson::colorspace_e::rec709;
+        break;
+      case colorspace_e::bt2020sdr:
+        jetson_colorspace = ::jetson::colorspace_e::bt2020_sdr;
+        break;
+      case colorspace_e::bt2020:
+        jetson_colorspace = ::jetson::colorspace_e::bt2020_pq;
+        break;
+    }
+
+    const auto fps = framerate_to_rational(config);
+    const auto bitrate_kbps = config::video.max_bitrate > 0 ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate;
+    const auto bitrate = static_cast<std::uint32_t>(std::clamp<std::int64_t>(
+      static_cast<std::int64_t>(bitrate_kbps) * 1000,
+      1,
+      std::numeric_limits<std::uint32_t>::max()
+    ));
+    const ::jetson::pipeline_config_t pipeline_config {
+      config.videoFormat == 0 ? ::jetson::codec_e::h264 : ::jetson::codec_e::hevc,
+      config.dynamicRange ? ::jetson::pixel_format_e::p010 : ::jetson::pixel_format_e::nv12,
+      jetson_colorspace,
+      config.width,
+      config.height,
+      fps.num,
+      fps.den,
+      bitrate,
+      static_cast<std::uint32_t>(std::clamp(config.numRefFrames, 1, 8)),
+      colorspace.full_range,
+    };
+
+    auto session = std::make_unique<jetson_encode_session_t>(std::move(software_device));
+    if (!session->start(pipeline_config)) {
+      BOOST_LOG(error) << "Could not start Jetson encoder: " << session->last_error();
+      return nullptr;
+    }
+    return session;
+  }
+#endif
+
   /**
    * @brief Create encode session.
    *
@@ -2318,6 +2589,12 @@ namespace video {
    * @return Constructed encode session object.
    */
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
+#ifdef SUNSHINE_BUILD_JETSON
+    if (dynamic_cast<const encoder_platform_formats_jetson *>(encoder.platform_formats.get())) {
+      auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
+      return make_jetson_encode_session(config, width, height, std::move(avcodec_encode_device));
+    }
+#endif
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
@@ -2556,6 +2833,10 @@ namespace video {
 
     if (dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get())) {
       result = disp.make_avcodec_encode_device(pix_fmt);
+#ifdef SUNSHINE_BUILD_JETSON
+    } else if (dynamic_cast<const encoder_platform_formats_jetson *>(encoder.platform_formats.get())) {
+      result = disp.make_avcodec_encode_device(pix_fmt);
+#endif
     } else if (dynamic_cast<const encoder_platform_formats_nvenc *>(encoder.platform_formats.get())) {
       result = disp.make_nvenc_encode_device(pix_fmt);
     }
@@ -3015,8 +3296,8 @@ namespace video {
       BOOST_LOG(info) << "Encoder ["sv << encoder.name << "] failed"sv;
     });
 
-    auto test_hevc = active_hevc_mode >= 2 || (active_hevc_mode == 0 && !(encoder.flags & H264_ONLY));
-    auto test_av1 = active_av1_mode >= 2 || (active_av1_mode == 0 && !(encoder.flags & H264_ONLY));
+    auto test_hevc = !encoder.hevc.name.empty() && (active_hevc_mode >= 2 || (active_hevc_mode == 0 && !(encoder.flags & H264_ONLY)));
+    auto test_av1 = !encoder.av1.name.empty() && (active_av1_mode >= 2 || (active_av1_mode == 0 && !(encoder.flags & H264_ONLY)));
 
     encoder.h264.capabilities.set();
     encoder.hevc.capabilities.set();

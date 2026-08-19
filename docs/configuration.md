@@ -2210,9 +2210,14 @@ editing the `conf` file in a text editor. Use the examples as reference.
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="5">Choices</td>
+        <td rowspan="7">Choices</td>
         <td>nvenc</td>
         <td>For NVIDIA graphics cards</td>
+    </tr>
+    <tr>
+        <td>jetson</td>
+        <td>Use the NVIDIA Jetson GStreamer hardware encoder for H.264 and HEVC.
+            @note{Applies to ARM64 Linux systems with NVIDIA Jetson GStreamer plugins only.}</td>
     </tr>
     <tr>
         <td>quicksync</td>

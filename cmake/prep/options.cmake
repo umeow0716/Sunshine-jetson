@@ -74,4 +74,6 @@ elseif(UNIX)  # Linux
             "Enable KWin ScreenCast grab if available" ON)
     option(SUNSHINE_ENABLE_PORTAL
             "Enable XDG portal grab if available" ON)
+    option(SUNSHINE_ENABLE_JETSON
+            "Enable NVIDIA Jetson GStreamer hardware encoding when available." ON)
 endif()

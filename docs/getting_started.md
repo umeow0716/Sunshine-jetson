@@ -440,6 +440,23 @@ After adding yourself to the group, log out and log back in for the changes to t
 
 ### Linux
 
+#### NVIDIA Jetson Linux 39.2 virtual input
+
+NVIDIA Jetson Linux 39.2 kernels may ship with `CONFIG_INPUT_UINPUT` disabled. On an AArch64
+`6.8.12-*-tegra` host, install the matching NVIDIA R39.2 uinput source as a DKMS module and configure
+Sunshine's virtual-input permissions with:
+
+```bash
+scripts/patch_jetson.sh
+```
+
+The script installs `uinput-tegra/6.8.12-r39.2`, adds the invoking user to the `input` group, configures
+`uinput` and `uhid` for startup, reloads the udev rules, and creates a temporary virtual pointer to verify
+the installation. Log out and back in after the first run so all processes inherit the new group membership.
+
+Do not use this package on a different kernel family. Obtain the source matching the installed Jetson Linux
+release and update the DKMS package version when upgrading beyond `6.8.12-*-tegra`.
+
 #### Services
 
 **Start once**

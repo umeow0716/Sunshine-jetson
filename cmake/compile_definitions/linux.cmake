@@ -124,6 +124,27 @@ if(LIBVA_FOUND)
             "${CMAKE_SOURCE_DIR}/src/platform/linux/vaapi.cpp")
 endif()
 
+# NVIDIA Jetson hardware encoding through the platform GStreamer plugins.
+# Restrict automatic discovery to ARM64 targets so ordinary Linux systems do not
+# probe a Jetson-only backend merely because generic GStreamer is installed.
+set(JETSON_GSTREAMER_FOUND OFF)
+if(${SUNSHINE_ENABLE_JETSON} AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    pkg_check_modules(JETSON_GSTREAMER QUIET IMPORTED_TARGET
+            gstreamer-1.0
+            gstreamer-app-1.0
+            gstreamer-video-1.0)
+endif()
+if(JETSON_GSTREAMER_FOUND)
+    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_BUILD_JETSON=1)
+    list(APPEND PLATFORM_LIBRARIES PkgConfig::JETSON_GSTREAMER)
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/jetson/jetson_encoder.h"
+            "${CMAKE_SOURCE_DIR}/src/jetson/jetson_encoder.cpp")
+    message(STATUS "NVIDIA Jetson GStreamer encoder enabled")
+elseif(${SUNSHINE_ENABLE_JETSON} AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    message(STATUS "NVIDIA Jetson GStreamer encoder disabled: development packages not found")
+endif()
+
 # vulkan video encoding (via FFmpeg)
 if(${SUNSHINE_ENABLE_VULKAN})
     if(NOT SUNSHINE_SYSTEM_VULKAN_HEADERS)

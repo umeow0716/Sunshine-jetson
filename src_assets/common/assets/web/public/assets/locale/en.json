@@ -228,6 +228,7 @@
     "virtualhid_randomize_mac_desc": "Use a random MAC address for PlayStation-style virtual controllers instead of one based on the controller index. This avoids mixing per-controller settings when controllers are swapped on the client.",
     "encoder": "Force a Specific Encoder",
     "encoder_desc": "Force a specific encoder, otherwise Sunshine will select the best available option. Note: If you specify a hardware encoder on Windows, it must match the GPU where the display is connected.",
+    "encoder_jetson": "NVIDIA Jetson (GStreamer)",
     "encoder_software": "Software",
     "encoders": "Encoders",
     "external_ip": "External IP",

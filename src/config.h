@@ -118,7 +118,7 @@ namespace config {
     } vk;  ///< Vulkan encoder options.
 
     std::string capture;  ///< Capture backend name selected by configuration.
-    std::string encoder;  ///< Encoder backend name selected by configuration.
+    std::string encoder;  ///< Encoder backend name selected by configuration, including `jetson` for Jetson GStreamer.
     std::string adapter_name;  ///< Display adapter name selected in configuration.
     std::string output_name;  ///< Display output name selected in configuration.
 

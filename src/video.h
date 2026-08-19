@@ -284,6 +284,24 @@ namespace video {
     }
   };
 
+#ifdef SUNSHINE_BUILD_JETSON
+  /**
+   * @brief System-memory pixel formats accepted by the Jetson GStreamer backend.
+   */
+  struct encoder_platform_formats_jetson: encoder_platform_formats_t {
+    /**
+     * @brief Construct the fixed NV12 and P010 mappings used on Jetson.
+     */
+    encoder_platform_formats_jetson() {
+      dev_type = platf::mem_type_e::system;
+      pix_fmt_8bit = platf::pix_fmt_e::nv12;
+      pix_fmt_10bit = platf::pix_fmt_e::p010;
+      pix_fmt_yuv444_8bit = platf::pix_fmt_e::unknown;
+      pix_fmt_yuv444_10bit = platf::pix_fmt_e::unknown;
+    }
+  };
+#endif
+
   /**
    * @brief Encoder name and feature flags advertised by Sunshine.
    */
@@ -456,6 +474,10 @@ namespace video {
 
 #if !defined(__APPLE__)
   extern encoder_t nvenc;  // available for windows and linux
+#endif
+
+#ifdef SUNSHINE_BUILD_JETSON
+  extern encoder_t jetson_gstreamer;  ///< NVIDIA Jetson GStreamer hardware encoder.
 #endif
 
 #ifdef _WIN32

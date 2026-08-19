@@ -103,6 +103,7 @@ const config = ref(props.config)
           </template>
           <template #linux>
             <option value="nvenc">NVIDIA NVENC</option>
+            <option value="jetson">{{ $t('config.encoder_jetson') }}</option>
             <option value="vaapi">VA-API</option>
             <option value="vulkan">Vulkan</option>
           </template>
