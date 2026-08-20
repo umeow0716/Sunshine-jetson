@@ -154,14 +154,10 @@ namespace platf {
     }  // namespace fix
 
     namespace composite {
-      using query_extension_fn = Bool (*)(Display *, int *, int *);
-      using query_version_fn = Status (*)(Display *, int *, int *);
       using name_window_pixmap_fn = Pixmap (*)(Display *, Window);
       using redirect_subwindows_fn = void (*)(Display *, Window, int);
       using unredirect_subwindows_fn = void (*)(Display *, Window, int);
 
-      static query_extension_fn QueryExtension {nullptr};
-      static query_version_fn QueryVersion {nullptr};
       static name_window_pixmap_fn NameWindowPixmap {nullptr};
       static redirect_subwindows_fn RedirectSubwindows {nullptr};
       static unredirect_subwindows_fn UnredirectSubwindows {nullptr};
@@ -184,8 +180,6 @@ namespace platf {
           }
         }
         std::vector<std::tuple<dyn::apiproc *, const char *>> funcs {
-          {(dyn::apiproc *) &QueryExtension, "XCompositeQueryExtension"},
-          {(dyn::apiproc *) &QueryVersion, "XCompositeQueryVersion"},
           {(dyn::apiproc *) &NameWindowPixmap, "XCompositeNameWindowPixmap"},
           {(dyn::apiproc *) &RedirectSubwindows, "XCompositeRedirectSubwindows"},
           {(dyn::apiproc *) &UnredirectSubwindows, "XCompositeUnredirectSubwindows"},
@@ -810,7 +804,6 @@ namespace platf {
     GLint uv_rect_location {-1};  ///< Shader location for normalized source crop coordinates.
     int cursor_width {0};  ///< Width of the uploaded cursor texture.
     int cursor_height {0};  ///< Height of the uploaded cursor texture.
-    bool subwindows_redirected {false};  ///< Whether this client redirected root child windows.
 
     /**
      * @brief Construct a GPU X11 display.
@@ -823,11 +816,6 @@ namespace platf {
      * @brief Release XComposite redirection and OpenGL compositor resources.
      */
     ~x11_gpu_attr_t() override {
-      if (subwindows_redirected && xdisplay) {
-        // CompositeRedirectAutomatic is defined as 0 by the XComposite protocol.
-        x11::composite::UnredirectSubwindows(xdisplay.get(), xwindow, 0);
-        XSync(xdisplay.get(), False);
-      }
       if (compositor_vao != 0 && egl_context) {
         gl::ctx.DeleteVertexArrays(1, &compositor_vao);
       }
@@ -1037,7 +1025,7 @@ namespace platf {
         gl::ctx.BindTexture(GL_TEXTURE_2D, texture);
         if (alpha_blend) {
           gl::ctx.Enable(GL_BLEND);
-          gl::ctx.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+          gl::ctx.BlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         } else {
           gl::ctx.Disable(GL_BLEND);
         }
@@ -1204,38 +1192,32 @@ namespace platf {
      * @brief Initialize X11, XComposite, EGL, and the OpenGL context.
      */
     int init(const std::string &display_name, const ::video::config_t &config) {
-      if (x11_attr_t::init(display_name, config) || x11::composite::init()) {
+      if (x11_attr_t::init(display_name, config)) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: base X11 display initialization"sv;
+        return -1;
+      }
+      if (x11::composite::init()) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: libXcomposite or required symbols unavailable"sv;
         return -1;
       }
 
-      int composite_event = 0;
-      int composite_error = 0;
-      int composite_major = 0;
-      int composite_minor = 0;
-      if (!x11::composite::QueryExtension(xdisplay.get(), &composite_event, &composite_error) ||
-          !x11::composite::QueryVersion(xdisplay.get(), &composite_major, &composite_minor) ||
-          composite_major < 0 || (composite_major == 0 && composite_minor < 2)) {
-        BOOST_LOG(error) << "XComposite 0.2 or newer is required for GPU X11 capture"sv;
-        return -1;
-      }
-
-      // XCompositeNameWindowPixmap only has defined contents for redirected
-      // windows. Redirect the root children once for the lifetime of this GPU
-      // capture client. CompositeRedirectAutomatic is 0 in the protocol and
-      // may be requested by multiple clients.
-      x11::composite::RedirectSubwindows(xdisplay.get(), xwindow, 0);
-      XSync(xdisplay.get(), False);
-      subwindows_redirected = true;
-
+      // Do not redirect the root subwindows here. On a normal composited X11
+      // desktop (GNOME/Mutter, KDE/KWin, etc.) the compositor already owns the
+      // redirection. Trying to redirect the root again can conflict with that
+      // owner. XCompositeNameWindowPixmap can name those already-redirected
+      // windows, which is the same model used by other GPU X11 capture tools.
       egl_display = egl::make_display(xdisplay.get());
       if (!egl_display) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: EGL display initialization"sv;
         return -1;
       }
       egl_context = egl::make_ctx(egl_display.get());
       if (!egl_context) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: OpenGL context creation"sv;
         return -1;
       }
       if (!gl::egl_image_target_texture_2d()) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: glEGLImageTargetTexture2DOES unavailable"sv;
         return -1;
       }
       const auto vertex = gl::shader_t::compile(
@@ -1250,6 +1232,10 @@ namespace platf {
         "}\n",
         GL_VERTEX_SHADER
       );
+      if (vertex.has_right()) {
+        BOOST_LOG(error) << "X11 GPU compositor vertex shader failed: "sv << vertex.right();
+        return -1;
+      }
       const auto fragment = gl::shader_t::compile(
         "#version 330\n"
         "in vec2 texcoord;\n"
@@ -1258,18 +1244,20 @@ namespace platf {
         "void main() { color = texture(source_texture, texcoord); }\n",
         GL_FRAGMENT_SHADER
       );
-      if (vertex.has_right() || fragment.has_right()) {
+      if (fragment.has_right()) {
+        BOOST_LOG(error) << "X11 GPU compositor fragment shader failed: "sv << fragment.right();
         return -1;
       }
       auto program = gl::program_t::link(vertex.left(), fragment.left());
       if (program.has_right()) {
+        BOOST_LOG(error) << "X11 GPU compositor shader link failed: "sv << program.right();
         return -1;
       }
       compositor_program = std::move(program.left());
       uv_rect_location = gl::ctx.GetUniformLocation(compositor_program.handle(), "uv_rect");
       const auto source_texture_location = gl::ctx.GetUniformLocation(compositor_program.handle(), "source_texture");
       if (uv_rect_location < 0 || source_texture_location < 0) {
-        BOOST_LOG(error) << "Could not locate X11 GPU compositor shader uniforms"sv;
+        BOOST_LOG(error) << "X11 GPU compositor init failed: shader uniforms unavailable"sv;
         return -1;
       }
       gl::ctx.UseProgram(compositor_program.handle());
@@ -1277,6 +1265,12 @@ namespace platf {
       gl::ctx.UseProgram(0);
       gl::ctx.GenVertexArrays(1, &compositor_vao);
       if (compositor_vao == 0) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: vertex array creation"sv;
+        return -1;
+      }
+      const auto init_gl_error = gl::ctx.GetError();
+      if (init_gl_error != GL_NO_ERROR) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed with GL error "sv << init_gl_error;
         return -1;
       }
       BOOST_LOG(info) << "X11 GPU compositor enabled through sampled EGL native pixmaps"sv;
