@@ -353,23 +353,55 @@ namespace gl {
 }  // namespace gl
 
 namespace gbm {
-  struct device;
+  struct device;  ///< Opaque GBM device handle.
+  struct bo;  ///< Opaque GBM buffer object handle.
   /**
    * @brief Function pointer used to destroy a GBM device.
    */
-  typedef void (*device_destroy_fn)(device *gbm);
+  using device_destroy_fn = void (*)(device *gbm);
   /**
    * @brief Function pointer used to create a GBM device from a file descriptor.
    */
-  typedef device *(*create_device_fn)(int fd);
+  using create_device_fn = device *(*)(int fd);
+  /**
+   * @brief Function pointer used to allocate a GBM buffer object.
+   */
+  using bo_create_fn = bo *(*)(device *gbm, std::uint32_t width, std::uint32_t height, std::uint32_t format, std::uint32_t flags);
+  /**
+   * @brief Function pointer used to destroy a GBM buffer object.
+   */
+  using bo_destroy_fn = void (*)(bo *buffer);
+  /**
+   * @brief Function pointer used to export a GBM buffer as a DMA-BUF.
+   */
+  using bo_get_fd_fn = int (*)(bo *buffer);
+  /**
+   * @brief Function pointer used to query a GBM buffer row stride.
+   */
+  using bo_get_stride_fn = std::uint32_t (*)(bo *buffer);
+  /**
+   * @brief Function pointer used to query a GBM buffer DRM modifier.
+   */
+  using bo_get_modifier_fn = std::uint64_t (*)(bo *buffer);
 
-  extern device_destroy_fn device_destroy;
-  extern create_device_fn create_device;
+  extern device_destroy_fn device_destroy;  ///< Loaded gbm_device_destroy entry point.
+  extern create_device_fn create_device;  ///< Loaded gbm_create_device entry point.
+  extern bo_create_fn bo_create;  ///< Loaded gbm_bo_create entry point.
+  extern bo_destroy_fn bo_destroy;  ///< Loaded gbm_bo_destroy entry point.
+  extern bo_get_fd_fn bo_get_fd;  ///< Loaded gbm_bo_get_fd entry point.
+  extern bo_get_stride_fn bo_get_stride;  ///< Loaded gbm_bo_get_stride entry point.
+  extern bo_get_modifier_fn bo_get_modifier;  ///< Loaded gbm_bo_get_modifier entry point.
 
   /**
    * @brief Owning GBM device pointer released with the GBM destroy callback.
    */
   using gbm_t = util::dyn_safe_ptr<device, &device_destroy>;
+  /**
+   * @brief Owning GBM buffer pointer released with the GBM destroy callback.
+   */
+  using bo_t = util::dyn_safe_ptr<bo, &bo_destroy>;
+
+  constexpr std::uint32_t bo_use_rendering = 1U << 2;  ///< Allocate a buffer suitable for rendering.
 
   /**
    * @brief Load GBM symbols required for EGL device creation.

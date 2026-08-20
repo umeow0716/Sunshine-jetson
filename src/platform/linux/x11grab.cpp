@@ -4,8 +4,10 @@
  */
 // standard includes
 #include <fstream>
+#include <mutex>
 #include <ranges>
 #include <thread>
+#include <unordered_map>
 
 // plaform includes
 #include <sys/ipc.h>
@@ -31,10 +33,6 @@
 #include "src/video.h"
 #include "vaapi.h"
 #include "x11grab.h"
-
-#ifdef SUNSHINE_BUILD_JETSON_NVMM
-  #include <nvbufsurface.h>
-#endif
 
 using namespace std::literals;
 
@@ -761,30 +759,37 @@ namespace platf {
   };
 
 #ifdef SUNSHINE_BUILD_JETSON_NVMM
+  std::mutex composite_error_mutex;  ///< Serializes the process-global Xlib error handler around XComposite requests.
+  thread_local bool composite_request_failed {false};  ///< Whether the current trapped XComposite request failed.
+
+  /**
+   * @brief Record an XComposite request failure without terminating capture.
+   *
+   * @param display X11 display reporting the asynchronous error.
+   * @param event X11 error details.
+   * @return Zero after recording the failure.
+   */
+  int trap_composite_error(Display * /*display*/, XErrorEvent *event) {
+    if (event && event->error_code == BadMatch) {
+      composite_request_failed = true;
+    }
+    return 0;
+  }
+
   /**
    * @brief GPU-backed X11 image retained for Jetson DMA-BUF capture.
    */
   struct x11_gpu_img_t: public egl::img_descriptor_t {
-    NvBufSurface *surface {nullptr};  ///< Pitch-linear BGRX surface rendered by OpenGL.
-    bool egl_mapped {false};  ///< Whether the NvBufSurface EGL image is mapped.
-    EGLImage target_image {EGL_NO_IMAGE};  ///< EGL image wrapping the output surface.
-    gl::tex_t target_texture;  ///< OpenGL texture bound to the output EGL image.
+    gbm::bo_t bo;  ///< NVIDIA GBM buffer exported to EGL and the Jetson VIC.
+    std::optional<egl::rgb_t> target_rgb;  ///< GBM DMA-BUF imported into the X11 EGL display.
     gl::frame_buf_t target_framebuffer;  ///< Framebuffer used as the compositor target.
 
     /**
-     * @brief Release the output surface and EGL resources.
+     * @brief Release output GL resources before the backing GBM buffer.
      */
     ~x11_gpu_img_t() override {
-      if (target_image != EGL_NO_IMAGE && target_texture.size() > 0) {
-        // NvBufSurface owns the EGL image; only release our GL reference here.
-        target_image = EGL_NO_IMAGE;
-      }
-      if (surface) {
-        if (egl_mapped) {
-          NvBufSurfaceUnMapEglImage(surface, 0);
-        }
-        NvBufSurfaceDestroy(surface);
-      }
+      target_framebuffer = gl::frame_buf_t {};
+      target_rgb.reset();
     }
   };
 
@@ -792,14 +797,39 @@ namespace platf {
    * @brief GPU-only X11 compositor using EGL native pixmap imports.
    *
    * The compositor renders the X11 root pixmap and top-level child windows
-   * directly into a Jetson NvBufSurface. No full-frame CPU readback or memcpy
+   * directly into a NVIDIA GBM DMA-BUF. No full-frame CPU readback or memcpy
    * is performed. The resulting DMA-BUF is consumed by the existing VIC path.
    */
   struct x11_gpu_attr_t: public x11_attr_t {
+    /**
+     * @brief XComposite pixmap imported once and reused across capture frames.
+     */
+    struct cached_pixmap_t {
+      Pixmap pixmap {None};  ///< X11 pixmap name backing the redirected window.
+      EGLImage image {EGL_NO_IMAGE};  ///< EGL image importing the X11 pixmap.
+      gl::tex_t texture;  ///< GL texture sampling the EGL image.
+      int width {0};  ///< Pixmap width when the cache entry was created.
+      int height {0};  ///< Pixmap height when the cache entry was created.
+      int depth {0};  ///< X11 drawable depth when the cache entry was created.
+      int x {0};  ///< Window X position in root coordinates.
+      int y {0};  ///< Window Y position in root coordinates.
+      std::uint64_t seen_frame {0};  ///< Capture generation in which the window was last visible.
+      bool visible {false};  ///< Whether the window is currently mapped and drawable.
+      bool owns_pixmap {false};  ///< Whether this client must free the X11 pixmap name.
+    };
+
+    file_t gbm_fd;  ///< NVIDIA display render-node file descriptor retained by the GBM device.
+    gbm::gbm_t gbm_device;  ///< NVIDIA GBM device used to allocate compositor targets.
     egl::display_t egl_display;  ///< EGL display connected to the X11 server.
     std::optional<egl::ctx_t> egl_context;  ///< Current OpenGL context.
     gl::program_t compositor_program;  ///< Shader used to sample imported X11 pixmaps.
     gl::tex_t cursor_texture;  ///< Cursor image texture.
+    std::unordered_map<Window, cached_pixmap_t> window_pixmaps;  ///< Imported top-level window pixmaps.
+    std::vector<Window> stacking_order;  ///< Top-level windows ordered from bottom to top.
+    cached_pixmap_t root_pixmap_cache;  ///< Imported desktop background pixmap.
+    std::uint64_t compositor_frame {0};  ///< Monotonic generation used to retire stale window cache entries.
+    bool window_tree_dirty {true};  ///< Whether X11 events require a window-tree refresh.
+    bool root_pixmap_dirty {true};  ///< Whether the desktop background property must be queried again.
     GLuint compositor_vao {0};  ///< Empty vertex array used by the compositor triangle.
     GLint uv_rect_location {-1};  ///< Shader location for normalized source crop coordinates.
     int cursor_width {0};  ///< Width of the uploaded cursor texture.
@@ -816,8 +846,16 @@ namespace platf {
      * @brief Release XComposite redirection and OpenGL compositor resources.
      */
     ~x11_gpu_attr_t() override {
-      if (compositor_vao != 0 && egl_context) {
-        gl::ctx.DeleteVertexArrays(1, &compositor_vao);
+      if (egl_context) {
+        eglMakeCurrent(egl_display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(*egl_context->operator->()));
+        for (auto &[window, cached] : window_pixmaps) {
+          release_cached_pixmap(cached);
+        }
+        window_pixmaps.clear();
+        release_cached_pixmap(root_pixmap_cache);
+        if (compositor_vao != 0) {
+          gl::ctx.DeleteVertexArrays(1, &compositor_vao);
+        }
       }
     }
 
@@ -832,39 +870,247 @@ namespace platf {
     }
 
     /**
-     * @brief Allocate a Jetson surface used as the GPU compositor target.
+     * @brief Allocate a renderable GBM DMA-BUF used as the compositor target.
      *
      * @return GPU-backed image, or null on allocation failure.
      */
     std::shared_ptr<img_t> alloc_img() override {
+      constexpr std::uint32_t drm_abgr8888 = 'A' | ('B' << 8) | ('2' << 16) | ('4' << 24);  ///< DRM ABGR8888 fourcc.
       auto img = std::make_shared<x11_gpu_img_t>();
-      NvBufSurfaceCreateParams params {};
-      params.gpuId = 0;
-      params.width = static_cast<std::uint32_t>(width);
-      params.height = static_cast<std::uint32_t>(height);
-      params.colorFormat = NVBUF_COLOR_FORMAT_BGRx;
-      params.layout = NVBUF_LAYOUT_PITCH;
-      params.memType = NVBUF_MEM_SURFACE_ARRAY;
-      if (NvBufSurfaceCreate(&img->surface, 1, &params) != 0 || !img->surface) {
-        BOOST_LOG(error) << "Could not allocate X11 GPU compositor surface"sv;
+      if (!gbm_device || !gbm::bo_create || !gbm::bo_get_fd || !gbm::bo_get_stride || !gbm::bo_get_modifier) {
+        BOOST_LOG(error) << "X11 GPU compositor GBM device is unavailable"sv;
         return nullptr;
       }
-      img->surface->numFilled = 1;
+      img->bo.reset(gbm::bo_create(
+        gbm_device.get(),
+        static_cast<std::uint32_t>(width),
+        static_cast<std::uint32_t>(height),
+        drm_abgr8888,
+        gbm::bo_use_rendering
+      ));
+      if (!img->bo) {
+        BOOST_LOG(error) << "Could not allocate X11 GPU compositor GBM buffer"sv;
+        return nullptr;
+      }
+      std::fill_n(img->sd.fds, 4, -1);
+      img->sd.fds[0] = gbm::bo_get_fd(img->bo.get());
+      if (img->sd.fds[0] < 0) {
+        BOOST_LOG(error) << "Could not export X11 GPU compositor GBM buffer"sv;
+        return nullptr;
+      }
       img->width = width;
       img->height = height;
       img->pixel_pitch = 4;
-      img->row_pitch = img->surface->surfaceList[0].pitch;
+      img->row_pitch = static_cast<int>(gbm::bo_get_stride(img->bo.get()));
       img->y_invert = true;
-      std::fill_n(img->sd.fds, 4, -1);
       img->sd.width = width;
       img->sd.height = height;
-      img->sd.fourcc = 'X' | ('R' << 8) | ('2' << 16) | ('4' << 24);
-      img->sd.modifier = 0;
-      // The DMA-BUF is exported only after rendering. Exporting it here and
-      // replacing the descriptor on the first snapshot leaks the initial fd.
-      img->sd.pitches[0] = img->surface->surfaceList[0].pitch;
+      img->sd.fourcc = drm_abgr8888;
+      img->sd.modifier = gbm::bo_get_modifier(img->bo.get());
+      img->sd.pitches[0] = static_cast<std::uint32_t>(img->row_pitch);
       img->sd.offsets[0] = 0;
       return img;
+    }
+
+    /**
+     * @brief Release one cached XComposite pixmap import.
+     *
+     * @param cached Cache entry to reset.
+     */
+    void release_cached_pixmap(cached_pixmap_t &cached) {
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+      cached.texture = gl::tex_t {};
+      if (cached.image != EGL_NO_IMAGE) {
+        eglDestroyImage(egl_display.get(), cached.image);
+      }
+      if (cached.owns_pixmap && cached.pixmap != None) {
+        XFreePixmap(xdisplay.get(), cached.pixmap);
+      }
+      cached.image = EGL_NO_IMAGE;
+      cached.pixmap = None;
+      cached.width = 0;
+      cached.height = 0;
+      cached.depth = 0;
+      cached.x = 0;
+      cached.y = 0;
+      cached.seen_frame = 0;
+      cached.visible = false;
+      cached.owns_pixmap = false;
+    }
+
+    /**
+     * @brief Import or replace a persistent XComposite pixmap cache entry.
+     *
+     * @param cached Cache entry to populate.
+     * @param pixmap X11 pixmap to import.
+     * @param source_width Pixmap width.
+     * @param source_height Pixmap height.
+     * @param depth X11 drawable depth.
+     * @param owns_pixmap Whether this client owns the pixmap XID.
+     * @return True when the pixmap is ready for sampling.
+     */
+    bool cache_pixmap(cached_pixmap_t &cached, Pixmap pixmap, int source_width, int source_height, int depth, bool owns_pixmap) {
+      release_cached_pixmap(cached);
+      if (pixmap == None) {
+        return false;
+      }
+      gl::tex_t texture;
+      EGLImage image = EGL_NO_IMAGE;
+      if (!import_pixmap(pixmap, texture, image)) {
+        if (owns_pixmap) {
+          XFreePixmap(xdisplay.get(), pixmap);
+        }
+        return false;
+      }
+      cached.pixmap = pixmap;
+      cached.image = image;
+      cached.texture = std::move(texture);
+      cached.width = source_width;
+      cached.height = source_height;
+      cached.depth = depth;
+      cached.owns_pixmap = owns_pixmap;
+      return true;
+    }
+
+    /**
+     * @brief Name a redirected window pixmap while trapping BadMatch.
+     *
+     * GNOME may expose viewable helper windows that Mutter did not redirect.
+     * XComposite reports those asynchronously, so isolate the single request
+     * behind XSync and return None instead of invoking Xlib's fatal handler.
+     *
+     * @param window X11 window whose redirected backing pixmap is requested.
+     * @return Named pixmap, or None when the window is not redirectable.
+     */
+    Pixmap name_window_pixmap(Window window) {
+      std::lock_guard lock {composite_error_mutex};
+      XSync(xdisplay.get(), False);
+      composite_request_failed = false;
+      const auto previous_handler = XSetErrorHandler(trap_composite_error);
+      const auto pixmap = x11::composite::NameWindowPixmap(xdisplay.get(), window);
+      XSync(xdisplay.get(), False);
+      XSetErrorHandler(previous_handler);
+      if (composite_request_failed) {
+        return None;
+      }
+      return pixmap;
+    }
+
+    /**
+     * @brief Refresh the top-level window cache and stacking order.
+     *
+     * @return True when the X11 window tree was read successfully.
+     */
+    bool refresh_window_tree() {
+      Window root_return = None;
+      Window parent_return = None;
+      Window *children = nullptr;
+      unsigned int child_count = 0;
+      if (!XQueryTree(xdisplay.get(), xwindow, &root_return, &parent_return, &children, &child_count)) {
+        return false;
+      }
+
+      ++compositor_frame;
+      stacking_order.clear();
+      stacking_order.reserve(child_count);
+      for (unsigned int index = 0; index < child_count; ++index) {
+        XWindowAttributes attributes {};
+        if (!XGetWindowAttributes(xdisplay.get(), children[index], &attributes) ||
+            attributes.map_state != IsViewable || attributes.width <= 0 || attributes.height <= 0) {
+          continue;
+        }
+
+        auto [cached_it, inserted] = window_pixmaps.try_emplace(children[index]);
+        auto &cached = cached_it->second;
+        const auto recreate = inserted || cached.texture.size() != 1 || cached.width != attributes.width || cached.height != attributes.height || cached.depth != attributes.depth;
+        if (recreate) {
+          const auto pixmap = name_window_pixmap(children[index]);
+          if (!cache_pixmap(cached, pixmap, attributes.width, attributes.height, attributes.depth, true)) {
+            window_pixmaps.erase(cached_it);
+            continue;
+          }
+        }
+        cached.x = attributes.x;
+        cached.y = attributes.y;
+        cached.visible = true;
+        cached.seen_frame = compositor_frame;
+        stacking_order.push_back(children[index]);
+      }
+      if (children) {
+        XFree(children);
+      }
+
+      for (auto it = window_pixmaps.begin(); it != window_pixmaps.end();) {
+        if (it->second.seen_frame != compositor_frame) {
+          release_cached_pixmap(it->second);
+          it = window_pixmaps.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      window_tree_dirty = false;
+      return true;
+    }
+
+    /**
+     * @brief Consume X11 structure notifications and update cached geometry.
+     *
+     * Window contents update in-place through their redirected pixmaps. Only
+     * structure changes need XQueryTree or a new XComposite pixmap import.
+     */
+    void process_window_events() {
+      while (XPending(xdisplay.get()) > 0) {
+        XEvent event {};
+        XNextEvent(xdisplay.get(), &event);
+        switch (event.type) {
+          case ConfigureNotify:
+            {
+              auto cached_it = window_pixmaps.find(event.xconfigure.window);
+              if (cached_it == window_pixmaps.end()) {
+                window_tree_dirty = true;
+                break;
+              }
+              auto &cached = cached_it->second;
+              const auto resized = cached.width != event.xconfigure.width || cached.height != event.xconfigure.height;
+              const auto depth = cached.depth;
+              if (resized) {
+                release_cached_pixmap(cached);
+                cached.width = event.xconfigure.width;
+                cached.height = event.xconfigure.height;
+                cached.depth = depth;
+              }
+              cached.x = event.xconfigure.x;
+              cached.y = event.xconfigure.y;
+              cached.visible = true;
+              break;
+            }
+          case UnmapNotify:
+          case DestroyNotify:
+            {
+              const auto window = event.type == UnmapNotify ? event.xunmap.window : event.xdestroywindow.window;
+              auto cached_it = window_pixmaps.find(window);
+              if (cached_it != window_pixmaps.end()) {
+                release_cached_pixmap(cached_it->second);
+                window_pixmaps.erase(cached_it);
+              }
+              std::erase(stacking_order, window);
+              break;
+            }
+          case PropertyNotify:
+            if (event.xproperty.window == xwindow) {
+              root_pixmap_dirty = true;
+            }
+            break;
+          case CreateNotify:
+          case MapNotify:
+          case ReparentNotify:
+          case CirculateNotify:
+            window_tree_dirty = true;
+            break;
+          default:
+            break;
+        }
+      }
     }
 
     /**
@@ -957,40 +1203,26 @@ namespace platf {
       if (!egl_context || eglMakeCurrent(egl_display.get(), EGL_NO_SURFACE, EGL_NO_SURFACE, std::get<1>(*egl_context->operator->())) == EGL_FALSE) {
         return capture_e::error;
       }
-      if (!img.egl_mapped) {
-        if (NvBufSurfaceMapEglImage(img.surface, 0) != 0 || !img.surface->surfaceList[0].mappedAddr.eglImage) {
-          return capture_e::error;
-        }
-        img.egl_mapped = true;
-        img.target_image = static_cast<EGLImage>(img.surface->surfaceList[0].mappedAddr.eglImage);
-        img.target_texture = gl::tex_t::make(1);
-        if (img.target_texture.size() != 1) {
-          return capture_e::error;
-        }
-        while (gl::ctx.GetError() != GL_NO_ERROR) {
-        }
-        while (eglGetError() != EGL_SUCCESS) {
-        }
-        gl::ctx.BindTexture(GL_TEXTURE_2D, img.target_texture[0]);
-        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        gl::ctx.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        gl::egl_image_target_texture_2d()(GL_TEXTURE_2D, img.target_image);
-        const auto target_gl_error = gl::ctx.GetError();
-        const auto target_egl_error = eglGetError();
-        gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-        if (target_gl_error != GL_NO_ERROR || target_egl_error != EGL_SUCCESS) {
-          BOOST_LOG(error) << "Could not bind X11 GPU compositor output EGL image; GL="sv << target_gl_error << ", EGL="sv << target_egl_error;
+      if (!img.target_rgb) {
+        img.target_rgb = egl::import_source(egl_display.get(), img.sd);
+        if (!img.target_rgb) {
+          BOOST_LOG(error) << "Could not import X11 GPU compositor GBM buffer into EGL"sv;
           return capture_e::error;
         }
         img.target_framebuffer = gl::frame_buf_t::make(1);
         gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, img.target_framebuffer[0]);
-        gl::ctx.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, img.target_texture[0], 0);
+        gl::ctx.FramebufferTexture2D(
+          GL_DRAW_FRAMEBUFFER,
+          GL_COLOR_ATTACHMENT0,
+          GL_TEXTURE_2D,
+          (*img.target_rgb)->tex[0],
+          0
+        );
         const auto target_status = gl::ctx.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+        const auto target_gl_error = gl::ctx.GetError();
         gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        if (target_status != GL_FRAMEBUFFER_COMPLETE) {
-          BOOST_LOG(error) << "X11 GPU compositor target framebuffer is incomplete: "sv << target_status;
+        if (target_gl_error != GL_NO_ERROR || target_status != GL_FRAMEBUFFER_COMPLETE) {
+          BOOST_LOG(error) << "X11 GPU compositor GBM framebuffer failed; GL="sv << target_gl_error << ", framebuffer="sv << target_status;
           return capture_e::error;
         }
       }
@@ -1038,64 +1270,54 @@ namespace platf {
         return true;
       };
 
-      auto draw_pixmap = [&](Pixmap pixmap, int source_width, int source_height, int dst_left, int dst_top, int source_left, int source_top, int copy_width, int copy_height, bool alpha_blend) {
-        if (pixmap == None || copy_width <= 0 || copy_height <= 0) {
-          return false;
-        }
-        gl::tex_t source_texture;
-        EGLImage source_image = EGL_NO_IMAGE;
-        if (!import_pixmap(pixmap, source_texture, source_image)) {
-          return false;
-        }
-        const auto rendered = draw_texture(source_texture[0], source_width, source_height, dst_left, dst_top, source_left, source_top, copy_width, copy_height, alpha_blend);
-        gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
-        eglDestroyImage(egl_display.get(), source_image);
-        return rendered;
-      };
+      process_window_events();
+      if (window_tree_dirty && !refresh_window_tree()) {
+        BOOST_LOG(error) << "X11 GPU compositor could not refresh the window tree"sv;
+        return capture_e::error;
+      }
 
       bool rendered_any_pixmap = false;
-      const auto background = root_pixmap();
-      rendered_any_pixmap |= draw_pixmap(background, env_width, env_height, 0, 0, offset_x, offset_y, width, height, false);
+      if (root_pixmap_dirty || root_pixmap_cache.texture.size() != 1) {
+        const auto background = root_pixmap();
+        if (background != root_pixmap_cache.pixmap || root_pixmap_cache.texture.size() != 1) {
+          cache_pixmap(root_pixmap_cache, background, env_width, env_height, 24, false);
+        }
+        root_pixmap_dirty = false;
+      }
+      if (root_pixmap_cache.texture.size() == 1) {
+        rendered_any_pixmap |= draw_texture(root_pixmap_cache.texture[0], env_width, env_height, 0, 0, offset_x, offset_y, width, height, false);
+      }
 
-      Window root_return = None;
-      Window parent_return = None;
-      Window *children = nullptr;
-      unsigned int child_count = 0;
-      if (XQueryTree(xdisplay.get(), xwindow, &root_return, &parent_return, &children, &child_count)) {
-        for (unsigned int index = 0; index < child_count; ++index) {
-          XWindowAttributes attributes {};
-          if (!XGetWindowAttributes(xdisplay.get(), children[index], &attributes) || attributes.map_state != IsViewable || attributes.width <= 0 || attributes.height <= 0) {
+      for (const auto window : stacking_order) {
+        auto cached_it = window_pixmaps.find(window);
+        if (cached_it == window_pixmaps.end() || !cached_it->second.visible) {
+          continue;
+        }
+        auto &cached = cached_it->second;
+        if (cached.texture.size() != 1) {
+          const auto x = cached.x;
+          const auto y = cached.y;
+          const auto source_width = cached.width;
+          const auto source_height = cached.height;
+          const auto depth = cached.depth;
+          const auto pixmap = name_window_pixmap(window);
+          if (!cache_pixmap(cached, pixmap, source_width, source_height, depth, true)) {
             continue;
           }
-          const auto left = std::max(attributes.x - offset_x, 0);
-          const auto top = std::max(attributes.y - offset_y, 0);
-          const auto source_left = std::max(offset_x - attributes.x, 0);
-          const auto source_top = std::max(offset_y - attributes.y, 0);
-          const auto copy_width = std::min(attributes.width - source_left, width - left);
-          const auto copy_height = std::min(attributes.height - source_top, height - top);
-          if (copy_width <= 0 || copy_height <= 0) {
-            continue;
-          }
-          const auto pixmap = x11::composite::NameWindowPixmap(xdisplay.get(), children[index]);
-          rendered_any_pixmap |= draw_pixmap(
-            pixmap,
-            attributes.width,
-            attributes.height,
-            left,
-            top,
-            source_left,
-            source_top,
-            copy_width,
-            copy_height,
-            attributes.depth == 32
-          );
-          if (pixmap != None) {
-            XFreePixmap(xdisplay.get(), pixmap);
-          }
+          cached.x = x;
+          cached.y = y;
+          cached.visible = true;
         }
-        if (children) {
-          XFree(children);
-        }
+        const auto left = std::max(cached.x - offset_x, 0);
+        const auto top = std::max(cached.y - offset_y, 0);
+        const auto source_left = std::max(offset_x - cached.x, 0);
+        const auto source_top = std::max(offset_y - cached.y, 0);
+        const auto copy_width = std::min(cached.width - source_left, width - left);
+        const auto copy_height = std::min(cached.height - source_top, height - top);
+        rendered_any_pixmap |= draw_texture(
+          cached.texture[0], cached.width, cached.height, left, top,
+          source_left, source_top, copy_width, copy_height, cached.depth == 32
+        );
       }
 
       if (!rendered_any_pixmap) {
@@ -1144,23 +1366,13 @@ namespace platf {
       gl::ctx.BindVertexArray(0);
       gl::ctx.UseProgram(0);
       gl::ctx.BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-      // The VIC consumer runs in a separate driver queue. Ensure rendering is
-      // complete before exporting the DMA-BUF to the encoder conversion path.
-      gl::ctx.Finish();
+      // Submit rendering without stalling the capture thread. The exported
+      // NvBufSurface DMA-BUF carries the NVIDIA driver's implicit fence into
+      // the VIC import path.
+      gl::ctx.Flush();
       img.frame_timestamp = std::chrono::steady_clock::now();
-      if (img.sd.fds[0] >= 0) {
-        close(img.sd.fds[0]);
-        img.sd.fds[0] = -1;
-      }
-      NvBufSurfaceMapParams map_params {};
-      if (NvBufSurfaceGetMapParams(img.surface, 0, &map_params) != 0) {
-        return capture_e::error;
-      }
-      img.sd.fds[0] = dup(static_cast<int>(map_params.fd));
-      img.sd.pitches[0] = map_params.planes[0].pitch;
-      img.sd.offsets[0] = map_params.planes[0].offset;
       img.data = nullptr;
-      return img.sd.fds[0] >= 0 ? capture_e::ok : capture_e::error;
+      return capture_e::ok;
     }
 
     /**
@@ -1200,6 +1412,20 @@ namespace platf {
         BOOST_LOG(error) << "X11 GPU compositor init failed: libXcomposite or required symbols unavailable"sv;
         return -1;
       }
+      if (gbm::init()) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: libgbm unavailable"sv;
+        return -1;
+      }
+      gbm_fd = file_t {::open("/dev/dri/by-path/platform-13800000.display-render", O_RDWR | O_CLOEXEC)};  // NOSONAR(cpp:S1874): `_sopen_s` not available
+      if (gbm_fd.el < 0) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: NVIDIA display render node unavailable"sv;
+        return -1;
+      }
+      gbm_device.reset(gbm::create_device(gbm_fd.el));
+      if (!gbm_device) {
+        BOOST_LOG(error) << "X11 GPU compositor init failed: NVIDIA GBM device creation"sv;
+        return -1;
+      }
 
       // Do not redirect the root subwindows here. On a normal composited X11
       // desktop (GNOME/Mutter, KDE/KWin, etc.) the compositor already owns the
@@ -1226,7 +1452,7 @@ namespace platf {
         "uniform vec4 uv_rect;\n"
         "void main() {\n"
         "  const vec2 positions[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));\n"
-        "  const vec2 uv = (positions[gl_VertexID] + 1.0) * 0.5;\n"
+        "  vec2 uv = (positions[gl_VertexID] + 1.0) * 0.5;\n"
         "  texcoord = uv_rect.xy + uv * uv_rect.zw;\n"
         "  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);\n"
         "}\n",
@@ -1273,15 +1499,31 @@ namespace platf {
         BOOST_LOG(error) << "X11 GPU compositor init failed with GL error "sv << init_gl_error;
         return -1;
       }
+      XSelectInput(
+        xdisplay.get(), xwindow,
+        StructureNotifyMask | SubstructureNotifyMask | PropertyChangeMask
+      );
+      XFlush(xdisplay.get());
       BOOST_LOG(info) << "X11 GPU compositor enabled through sampled EGL native pixmaps"sv;
       return 0;
     }
 
     /**
-     * @brief Report that dummy frames are valid for this backend.
+     * @brief Render the encoder probe frame through the GPU compositor.
+     *
+     * The base X11 implementation uses XGetImage and assumes an x11_img_t.
+     * GPU images must instead be rendered into their NvBufSurface so the
+     * Jetson encoder probe receives the same DMA-BUF path as a live stream.
+     *
+     * @param img GPU-backed image allocated by alloc_img().
+     * @return Zero when the DMA-BUF frame is ready; otherwise negative one.
      */
-    int dummy_img(img_t * /*img*/) override {
-      return 0;
+    int dummy_img(img_t *img) override {
+      auto *gpu_img = dynamic_cast<x11_gpu_img_t *>(img);
+      if (!gpu_img) {
+        return -1;
+      }
+      return snapshot(*gpu_img, true) == capture_e::ok ? 0 : -1;
     }
   };
 #endif

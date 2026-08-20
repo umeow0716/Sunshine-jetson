@@ -299,6 +299,11 @@ namespace gl {
 namespace gbm {
   device_destroy_fn device_destroy;  ///< Device destroy.
   create_device_fn create_device;  ///< Create device.
+  bo_create_fn bo_create;  ///< Allocate a buffer object.
+  bo_destroy_fn bo_destroy;  ///< Destroy a buffer object.
+  bo_get_fd_fn bo_get_fd;  ///< Export a buffer object DMA-BUF.
+  bo_get_stride_fn bo_get_stride;  ///< Query a buffer object stride.
+  bo_get_modifier_fn bo_get_modifier;  ///< Query a buffer object DRM modifier.
 
   /**
    * @brief Load GBM symbols required for EGL device creation.
@@ -321,6 +326,11 @@ namespace gbm {
     std::vector<std::tuple<GLADapiproc *, const char *>> funcs {
       {(GLADapiproc *) &device_destroy, "gbm_device_destroy"},
       {(GLADapiproc *) &create_device, "gbm_create_device"},
+      {(GLADapiproc *) &bo_create, "gbm_bo_create"},
+      {(GLADapiproc *) &bo_destroy, "gbm_bo_destroy"},
+      {(GLADapiproc *) &bo_get_fd, "gbm_bo_get_fd"},
+      {(GLADapiproc *) &bo_get_stride, "gbm_bo_get_stride"},
+      {(GLADapiproc *) &bo_get_modifier, "gbm_bo_get_modifier"},
     };
 
     if (dyn::load(handle, funcs)) {
